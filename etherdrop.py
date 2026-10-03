@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "EtherDrop"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPOSITORY = "JaafarTanoukhi/EtherDrop"
 RELEASE_ASSET = "EtherDrop.exe"
 PROTOCOL_VERSION = 2
