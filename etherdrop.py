@@ -2524,7 +2524,6 @@ class EtherDropApp(tk.Tk):
 
         header = ttk.Frame(outer, style="App.TFrame")
         header.pack(fill="x")
-        self._build_update_button(header)
         brand = tk.Label(
             header,
             text="ED",
