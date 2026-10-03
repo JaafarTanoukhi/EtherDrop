@@ -1,6 +1,7 @@
 name: Release EtherDrop
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - release
@@ -28,6 +29,10 @@ jobs:
       - name: Prepare version and release notes
         id: prepare
         run: python scripts/prepare_release.py
+      - name: Verify prepared version
+        env:
+          RELEASE_VERSION: ${{ steps.prepare.outputs.version }}
+        run: python -c "import os; from etherdrop import APP_VERSION; assert APP_VERSION == os.environ['RELEASE_VERSION']"
       - name: Install build dependency
         run: python -m pip install pyinstaller
       - name: Build standalone executable

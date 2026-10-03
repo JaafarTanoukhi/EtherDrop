@@ -37,6 +37,8 @@ Edit **RELEASE_NOTES.md** before pushing to provide your own update notes. If yo
 
 Pushes to `main` do not publish releases. You can also build locally and upload **EtherDrop.exe** to a matching GitHub release manually. EtherDrop compares stable `vMAJOR.MINOR.PATCH` versions and never installs an older release.
 
+You can start a build manually from **Actions → Release EtherDrop → Run workflow**, selecting the `release` branch.
+
 ## What it guarantees
 
 - It never selects a Wi-Fi adapter.
