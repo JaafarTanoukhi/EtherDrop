@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: etherdrop-release
-  queue: max
+  cancel-in-progress: false
 
 jobs:
   release:
