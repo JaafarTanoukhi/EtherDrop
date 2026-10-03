@@ -20,18 +20,23 @@ Automatic checks stay quiet when offline or already up to date. Running from Pyt
 
 ## Publishing a new version
 
-Push your changes to the **release** branch to publish a new version:
+Make changes on **main** first, then advance **release** to publish a new version. Keep `main` equal to or ahead of `release`:
 
 ```powershell
-git switch release
+git switch main
 git pull --ff-only
 # Make your changes and commit them.
+git push origin main
+git switch release
+git pull --ff-only
+git merge --ff-only main
 git push origin release
+git switch main
 ```
 
 The first release is **v1.0.0**. Each subsequent push automatically increments the patch: **1.0.1**, **1.0.2**, and so on. For an explicit minor or major release, set `APP_VERSION` in `etherdrop.py` to a higher version, such as **1.1.0** or **2.0.0**, before pushing. Patch increments then continue from that version. Normal pushes do not require editing a version number.
 
-The GitHub Actions workflow tests the app, prepares the version and notes, builds the standalone Windows EXE, commits the version, manifest, and notes back to `release`, tags that exact commit, and publishes **EtherDrop.exe**. The source, tag, and EXE have matching versions. Its own push uses GitHub's built-in token and does not trigger another release. Builds run one at a time; if the branch changes during a build, its push fails safely and the next queued build uses the latest branch. Pull the bot's commit after a release finishes before making your next changes.
+The GitHub Actions workflow tests the app, prepares the version and notes, builds the standalone Windows EXE, commits the version, manifest, and notes on `release`, merges that commit into `main`, and pushes both branches and the version tag together before publishing **EtherDrop.exe**. Any newer work on `main` is preserved. If a merge conflicts or either branch changes during the build, publication stops so the branches can be reconciled. The source, tag, and EXE have matching versions. Its own push uses GitHub's built-in token and does not trigger another release. Pull the bot's commit after a release finishes before making your next changes.
 
 Edit **RELEASE_NOTES.md** before pushing to provide your own update notes. If you leave it unchanged, the workflow generates notes from commit titles since the previous release. Write meaningful commit titles so those automatic notes are useful. The same notes appear on GitHub and inside the EXE.
 

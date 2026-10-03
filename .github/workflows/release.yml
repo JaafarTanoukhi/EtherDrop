@@ -38,7 +38,7 @@ jobs:
       - name: Build standalone executable
         shell: cmd
         run: build.bat
-      - name: Commit and tag the release
+      - name: Commit, tag, and sync main
         env:
           RELEASE_VERSION: ${{ steps.prepare.outputs.version }}
         run: |
@@ -52,7 +52,15 @@ jobs:
           }
           git tag "v$env:RELEASE_VERSION"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git push --atomic origin HEAD:release "v$env:RELEASE_VERSION"
+          git fetch origin main
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git switch -C main origin/main
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git merge --no-edit release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git switch release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git push --atomic origin release main "v$env:RELEASE_VERSION"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Publish release
         env:
