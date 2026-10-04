@@ -75,6 +75,25 @@ class UpdateTests(unittest.TestCase):
                             etherdrop.download_update(release, queue.Queue())
                     self.assertEqual(list(Path(folder).iterdir()), [target])
 
+    def test_updater_restart_uses_fresh_pyinstaller_runtime(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "EtherDrop.exe"
+            staging = Path(folder) / ".etherdrop-update-test"
+            staging.mkdir()
+            inherited = {
+                "_PYI_ARCHIVE_FILE": str(target),
+                "_PYI_APPLICATION_HOME_DIR": str(Path(folder) / "_MEIold"),
+                "PYINSTALLER_RESET_ENVIRONMENT": "0",
+            }
+            with patch.object(etherdrop.sys, "executable", str(target)), \
+                    patch.dict(etherdrop.os.environ, inherited), \
+                    patch.object(etherdrop.subprocess, "Popen") as launch:
+                etherdrop.launch_updater(staging)
+                environment = launch.call_args.kwargs["env"]
+                self.assertEqual(environment["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+                self.assertEqual(environment["_PYI_ARCHIVE_FILE"], str(target))
+                self.assertEqual(etherdrop.os.environ["PYINSTALLER_RESET_ENVIRONMENT"], "0")
+
     def test_startup_and_manual_check_use_worker_queue(self):
         app = etherdrop.EtherDropApp.__new__(etherdrop.EtherDropApp)
         app.update_busy = False
@@ -85,6 +104,23 @@ class UpdateTests(unittest.TestCase):
             self.assertEqual(app.events.get(timeout=2), ("update_checked", None, True))
             app.check_for_updates()
             self.assertTrue(app.events.empty())
+
+    def test_download_progress_reports_bytes_and_current_speed(self):
+        data = b"MZ" + b"x" * (128 * 1024 - 2)
+        release = {"asset": self.release(data=data)["assets"][0]}
+        events = queue.Queue()
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "EtherDrop.exe"
+            with patch.object(etherdrop.sys, "executable", str(target)), \
+                    patch.object(etherdrop, "urlopen", return_value=io.BytesIO(data)), \
+                    patch.object(etherdrop.time, "monotonic", side_effect=[0.0, 0.5, 1.5]):
+                staging = etherdrop.download_update(release, events)
+            self.assertEqual(list(events.queue), [
+                ("update_progress", 0, len(data), 0.0),
+                ("update_progress", 64 * 1024, len(data), 128 * 1024),
+                ("update_progress", len(data), len(data), 64 * 1024),
+            ])
+            etherdrop.shutil.rmtree(staging)
 
     def test_manual_no_update_opens_current_notes_without_downgrading(self):
         app = etherdrop.EtherDropApp.__new__(etherdrop.EtherDropApp)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import hashlib
 import ctypes
 import json
@@ -16,20 +17,22 @@ import tempfile
 import threading
 import time
 import uuid
+import zlib
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 
 APP_NAME = "EtherDrop"
-APP_VERSION = "1.0.1"
+APP_VERSION = "2.0.0"
 GITHUB_REPOSITORY = "JaafarTanoukhi/EtherDrop"
 RELEASE_ASSET = "EtherDrop.exe"
-PROTOCOL_VERSION = 2
-MAGIC = "ETHERDROP_V2"
+PROTOCOL_VERSION = 3
+MAGIC = "ETHERDROP_V3"
 DISCOVERY_PORT = 45670
 TRANSFER_PORT = 45671
 DISCOVERY_GROUP = "ff02::1"
@@ -39,27 +42,282 @@ PEER_TIMEOUT = 4.0
 BLOCK_SIZE = 8 * 1024 * 1024
 SOCKET_BUFFER = 4 * 1024 * 1024
 MAX_CONTROL_FRAME = 1024 * 1024
+TRANSFER_TIMEOUT = 15.0
+RECONNECT_DELAY = 1.0
+TRANSFER_HEARTBEAT_INTERVAL = 2.0
 
 SESSION_ID = uuid.uuid4().hex
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 
-COLOR_BG = "#08111F"
-COLOR_SURFACE = "#101B2E"
-COLOR_SURFACE_ALT = "#16243B"
-COLOR_PANEL = "#0C1728"
-COLOR_BORDER = "#243653"
-COLOR_TEXT = "#F4F7FB"
-COLOR_MUTED = "#91A2BC"
-COLOR_ACCENT = "#7567FF"
-COLOR_ACCENT_HOVER = "#897DFF"
-COLOR_CYAN = "#35C8E6"
-COLOR_CYAN_HOVER = "#59D5ED"
-COLOR_SUCCESS = "#35D399"
-COLOR_WARNING = "#F4B84A"
-COLOR_DANGER = "#F0657A"
-COLOR_DANGER_HOVER = "#F47C8E"
+COLOR_BG = "#F3F4F5"
+COLOR_SURFACE = "#FFFFFF"
+COLOR_SURFACE_ALT = "#E7E9EC"
+COLOR_PANEL = "#F8F9FA"
+COLOR_BORDER = "#DCDFE3"
+COLOR_TEXT = "#22252B"
+COLOR_MUTED = "#686C76"
+COLOR_ACCENT = "#55616E"
+COLOR_ACCENT_HOVER = "#414C58"
+COLOR_CYAN = "#55616E"
+COLOR_CYAN_HOVER = "#414C58"
+COLOR_SUCCESS = "#237D52"
+COLOR_WARNING = "#986416"
+COLOR_DANGER = "#BC3E49"
+COLOR_DANGER_HOVER = "#A7313C"
+
+THEMES = {
+    "ethernet": {name: value for name, value in globals().copy().items() if name.startswith("COLOR_")},
+    "wifi": {
+        "COLOR_BG": "#F1F5FA", "COLOR_SURFACE": "#FFFFFF", "COLOR_SURFACE_ALT": "#E6EDF7",
+        "COLOR_PANEL": "#F7F9FD", "COLOR_BORDER": "#D8E1EE", "COLOR_TEXT": COLOR_TEXT,
+        "COLOR_MUTED": COLOR_MUTED, "COLOR_ACCENT": "#266CD3", "COLOR_ACCENT_HOVER": "#1D56AF",
+        "COLOR_CYAN": "#266CD3", "COLOR_CYAN_HOVER": "#1D56AF",
+        "COLOR_SUCCESS": COLOR_SUCCESS, "COLOR_WARNING": COLOR_WARNING,
+        "COLOR_DANGER": COLOR_DANGER, "COLOR_DANGER_HOVER": COLOR_DANGER_HOVER,
+    },
+}
+THEMES["neutral"] = {**THEMES["ethernet"], "COLOR_BG": "#F4F4F5",
+    "COLOR_SURFACE_ALT": "#E8E8EB", "COLOR_PANEL": "#F8F8F9", "COLOR_BORDER": "#DEDEE2",
+    "COLOR_ACCENT": "#50545E", "COLOR_ACCENT_HOVER": "#383C45",
+    "COLOR_CYAN": "#50545E", "COLOR_CYAN_HOVER": "#383C45"}
+
+
+def apply_mode_theme(root: tk.Misc, mode: str) -> None:
+    globals().update(THEMES[mode])
+    configure_modern_theme(root)
+
+
+def icon_image(parent, name, tone="ink", size=24):
+    root = parent.winfo_toplevel()
+    pixels = min((24, 30, 36, 42, 48, 60, 72, 84, 96),
+                 key=lambda value: abs(value - size * root.ui_scale))
+    key = (name, tone, pixels)
+    if not hasattr(root, "icon_images"):
+        root.icon_images = {}
+    if key not in root.icon_images:
+        path = Path(__file__).resolve().parent / "assets" / "icons" / f"{name}-{tone}-{pixels}.png"
+        root.icon_images[key] = tk.PhotoImage(master=root, data=path.read_bytes())
+    return root.icon_images[key]
+
+
+def mode_badge(parent, mode: str, background: str = None):
+    background = background or COLOR_BG
+    box = tk.Frame(parent, bg=background)
+    tk.Label(box, image=icon_image(parent, "wifi" if mode == "wifi" else "ethernet-port", mode),
+             bg=background).pack(side="left", padx=(0, 8))
+    tk.Label(box, text="Wi-Fi" if mode == "wifi" else "Ethernet", bg=background,
+             fg=COLOR_ACCENT, font=("Segoe UI", 10)).pack(side="left")
+    return box
+
+
+def view_snapshot(parent):
+    """Copy only our own view into memory for a transition; never capture the desktop."""
+    user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
+    pointer = ctypes.c_void_p
+    user32.GetWindowDC.argtypes, user32.GetWindowDC.restype = [pointer], pointer
+    user32.GetAncestor.argtypes, user32.GetAncestor.restype = [pointer, ctypes.c_uint], pointer
+    user32.GetForegroundWindow.restype = pointer
+    user32.ReleaseDC.argtypes = [pointer, pointer]
+    gdi32.BitBlt.argtypes = [pointer, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                            pointer, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    gdi32.CreateCompatibleDC.argtypes, gdi32.CreateCompatibleDC.restype = [pointer], pointer
+    gdi32.CreateDIBSection.argtypes = [pointer, pointer, ctypes.c_uint, pointer, pointer, ctypes.c_uint]
+    gdi32.CreateDIBSection.restype = pointer
+    gdi32.SelectObject.argtypes, gdi32.SelectObject.restype = [pointer, pointer], pointer
+    gdi32.DeleteObject.argtypes = [pointer]
+    gdi32.DeleteDC.argtypes = [pointer]
+    width, height = parent.winfo_width(), parent.winfo_height()
+    header = struct.pack("<IiiHHIIiiII", 40, width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
+    info = ctypes.create_string_buffer(header)
+    pixels = pointer()
+    handle = parent.winfo_id()
+    if user32.GetAncestor(handle, 2) != user32.GetForegroundWindow():
+        return None
+    dc = user32.GetWindowDC(handle)
+    memory = gdi32.CreateCompatibleDC(dc)
+    bitmap = gdi32.CreateDIBSection(dc, info, 0, ctypes.byref(pixels), None, 0)
+    old_bitmap = gdi32.SelectObject(memory, bitmap)
+    try:
+        if not gdi32.BitBlt(memory, 0, 0, width, height, dc, 0, 0, 0x00CC0020):
+            return None
+        rgba = ctypes.string_at(pixels, width * height * 4)
+        rgb = bytearray(width * height * 3)
+        rgb[0::3], rgb[1::3], rgb[2::3] = rgba[2::4], rgba[1::4], rgba[0::4]
+        return tk.PhotoImage(master=parent.winfo_toplevel(),
+                            data=f"P6\n{width} {height}\n255\n".encode() + rgb, format="PPM")
+    finally:
+        gdi32.SelectObject(memory, old_bitmap)
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(memory)
+        user32.ReleaseDC(handle, dc)
+
+
+def finish_motion(parent):
+    root = parent._root()
+    if getattr(root, "motion_parent", None) is not parent:
+        return
+    if root.motion_callback:
+        root.after_cancel(root.motion_callback)
+    root.motion_callback = None
+    root.motion_parent = None
+    root.motion_prepared = False
+    root.motion_overlay.attributes("-alpha", 0)
+    root.motion_overlay.withdraw()
+    root.motion_label.configure(image="")
+    root.motion_image = None
+
+
+def present_motion(overlay):
+    user32, dwmapi = ctypes.windll.user32, ctypes.windll.dwmapi
+    pointer = ctypes.c_void_p
+    user32.GetAncestor.argtypes, user32.GetAncestor.restype = [pointer, ctypes.c_uint], pointer
+    dwmapi.DwmSetWindowAttribute.argtypes = [pointer, ctypes.c_uint, pointer, ctypes.c_uint]
+    handle = user32.GetAncestor(overlay.winfo_id(), 2)
+    disabled = ctypes.c_int(1)
+    # Our fade controls visibility; Windows must not animate the cover appearing.
+    dwmapi.DwmSetWindowAttribute(handle, 3, ctypes.byref(disabled), ctypes.sizeof(disabled))
+    overlay.attributes("-alpha", 1)
+    overlay.update_idletasks()
+    ctypes.windll.gdi32.GdiFlush()
+    # Present the old view before any page or palette changes can become visible.
+    dwmapi.DwmFlush()
+
+
+def begin_motion(parent):
+    root = parent.winfo_toplevel()
+    if getattr(root, "motion_prepared", False):
+        return
+    active_parent = getattr(root, "motion_parent", None)
+    if active_parent is not None:
+        finish_motion(active_parent)
+    if platform.system() != "Windows" or not parent.winfo_ismapped():
+        return
+    parent.update_idletasks()
+    snapshot = view_snapshot(parent)
+    if snapshot is None:
+        return
+    if not hasattr(root, "motion_overlay"):
+        root.motion_overlay = tk.Toplevel(root)
+        root.motion_overlay.withdraw()
+        root.motion_overlay.overrideredirect(True)
+        root.motion_overlay.transient(root)
+        # Create a layered window before its first visible frame, avoiding a style-change flash.
+        root.motion_overlay.attributes("-toolwindow", True, "-disabled", True, "-alpha", 0)
+        root.motion_label = tk.Label(root.motion_overlay, borderwidth=0, highlightthickness=0)
+        root.motion_label.pack(fill="both", expand=True)
+    root.motion_parent = parent
+    root.motion_prepared = True
+    root.motion_callback = None
+    root.motion_image = snapshot
+    root.motion_label.configure(image=snapshot)
+    root.motion_bounds = (parent.winfo_width(), parent.winfo_height(), parent.winfo_rootx(), parent.winfo_rooty())
+    width, height, x, y = root.motion_bounds
+    root.motion_overlay.geometry(f"{width}x{height}+{x}+{y}")
+    root.motion_overlay.deiconify()
+    root.motion_overlay.lift(root)
+    # Process mapping and paint events while transparent; idle work alone leaves
+    # the previous transition's pixels in the reused window.
+    root.motion_overlay.update()
+    present_motion(root.motion_overlay)
+
+
+def show_view(frame, previous=None, animate=True):
+    parent, root = frame.master, frame.winfo_toplevel()
+    if animate:
+        begin_motion(parent)
+    if previous is not None:
+        previous.pack_forget()
+    frame.pack(fill="both", expand=True)
+    if not animate or getattr(root, "motion_parent", None) is not parent:
+        return
+    if root.motion_callback:
+        root.after_cancel(root.motion_callback)
+
+    def start():
+        root.motion_prepared = False
+        root.update_idletasks()
+        started = time.monotonic()
+
+        def step():
+            if not parent.winfo_exists():
+                finish_motion(parent)
+                return
+            bounds = (parent.winfo_width(), parent.winfo_height(), parent.winfo_rootx(), parent.winfo_rooty())
+            if not parent.winfo_ismapped() or bounds != root.motion_bounds:
+                finish_motion(parent)
+                return
+            progress = min((time.monotonic() - started) / .22, 1)
+            root.motion_overlay.attributes("-alpha", 1 - progress*progress*(3-2*progress))
+            if progress < 1:
+                root.motion_callback = root.after(16, step)
+            else:
+                finish_motion(parent)
+        step()
+    root.motion_callback = root.after_idle(start)
+
+
+class RoundedCard(tk.Canvas):
+    def __init__(self, parent, padding=20, height=160):
+        scale = parent.winfo_toplevel().ui_scale
+        super().__init__(parent, bg=COLOR_BG, highlightthickness=0, borderwidth=0, height=round(height * scale))
+        self.padding = round(padding * scale)
+        self.body = ttk.Frame(self, style="Card.TFrame")
+        self.shape = self.create_polygon(0, 0, 0, 0, smooth=True, fill=COLOR_SURFACE, outline="")
+        self.body_window = self.create_window(self.padding, self.padding, window=self.body, anchor="nw")
+        self.bind("<Configure>", self._resize)
+
+    def _resize(self, event):
+        width, height, radius = event.width, event.height, round(18 * self.winfo_toplevel().ui_scale)
+        self.coords(self.shape, radius, 0, width-radius, 0, width, 0, width, radius,
+                    width, height-radius, width, height, width-radius, height,
+                    radius, height, 0, height, 0, height-radius, 0, radius, 0, 0)
+        self.itemconfigure(self.body_window, width=max(width-2*self.padding, 1),
+                           height=max(height-2*self.padding, 1))
+
+
+@lru_cache(maxsize=128)
+def rounded_button_data(color, background, focus_color=None):
+    size, radius = 32, 10
+    red, green, blue = (int(color[index:index+2], 16) for index in (1, 3, 5))
+    backdrop = tuple(int(background[index:index+2], 16) for index in (1, 3, 5))
+    rows = bytearray()
+    for y in range(size):
+        rows.append(0)
+        for x in range(size):
+            dx = max(radius - x - .5, x + .5 - (size - radius), 0)
+            dy = max(radius - y - .5, y + .5 - (size - radius), 0)
+            alpha = round(max(0, min(1, radius + .5 - (dx*dx + dy*dy)**.5)) * 255)
+            distance = min(x + .5, y + .5, size - x - .5, size - y - .5)
+            if dx and dy:
+                distance = radius - (dx*dx + dy*dy)**.5
+            if focus_color and distance < 2:
+                rgb = tuple(int(focus_color[index:index+2], 16) for index in (1, 3, 5))
+            else:
+                rgb = (red, green, blue)
+            rgb = tuple(round(channel * alpha / 255 + behind * (255-alpha) / 255)
+                        for channel, behind in zip(rgb, backdrop))
+            rows.extend((*rgb, 255))
+    def chunk(kind, data):
+        return struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind + data))
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!2I5B", size, size, 8, 6, 0, 0, 0))
+    png += chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+    return png
+
+
+def rounded_button_image(root, color, background, focused=False):
+    key = (color, background, COLOR_ACCENT if focused else None)
+    if not hasattr(root, "button_image_cache"):
+        root.button_image_cache = {}
+    if key not in root.button_image_cache:
+        root.button_image_cache[key] = tk.PhotoImage(master=root, data=rounded_button_data(*key))
+    return root.button_image_cache[key]
+
+
+def accent_tint(opacity):
+    return "#" + "".join(f"{round(int(COLOR_ACCENT[i:i+2], 16)*opacity + int(COLOR_BG[i:i+2], 16)*(1-opacity)):02X}"
+                         for i in (1, 3, 5))
 
 DPI_AWARENESS_MODE = "Unknown"
 
@@ -131,7 +389,9 @@ def set_scaled_window_geometry(
     actual_height = min(round(height * scale), available_height)
     actual_min_width = min(round(min_width * scale), available_width)
     actual_min_height = min(round(min_height * scale), available_height)
-    window.geometry(f"{actual_width}x{actual_height}")
+    x = max(0, min(window.winfo_x(), screen_width - actual_width - 20))
+    y = max(0, min(window.winfo_y(), screen_height - actual_height - 70))
+    window.geometry(f"{actual_width}x{actual_height}+{x}+{y}")
     window.minsize(actual_min_width, actual_min_height)
 
 
@@ -141,117 +401,111 @@ enable_high_dpi_awareness()
 def configure_modern_theme(root: tk.Misc) -> None:
     style = ttk.Style(root)
     style.theme_use("clam")
-
     root.configure(background=COLOR_BG)
-    style.configure(".", font=("Segoe UI", 10), background=COLOR_BG, foreground=COLOR_TEXT)
-    style.configure("App.TFrame", background=COLOR_BG)
-    style.configure("Card.TFrame", background=COLOR_SURFACE)
-    style.configure("Panel.TFrame", background=COLOR_PANEL)
-
+    style.configure(".", font=("Segoe UI", 11), background=COLOR_BG, foreground=COLOR_TEXT)
+    for name, color in (("App", COLOR_BG), ("Card", COLOR_SURFACE), ("Panel", COLOR_PANEL)):
+        style.configure(f"{name}.TFrame", background=color)
     style.configure("TLabel", background=COLOR_BG, foreground=COLOR_TEXT)
-    style.configure("Hero.TLabel", background=COLOR_BG, foreground=COLOR_TEXT, font=("Segoe UI", 25, "bold"))
-    style.configure("Title.TLabel", background=COLOR_BG, foreground=COLOR_TEXT, font=("Segoe UI", 20, "bold"))
-    style.configure("Subtitle.TLabel", background=COLOR_BG, foreground=COLOR_MUTED, font=("Segoe UI", 10))
-    style.configure("Card.TLabel", background=COLOR_SURFACE, foreground=COLOR_TEXT)
-    style.configure("CardTitle.TLabel", background=COLOR_SURFACE, foreground=COLOR_TEXT, font=("Segoe UI", 12, "bold"))
-    style.configure("CardMuted.TLabel", background=COLOR_SURFACE, foreground=COLOR_MUTED)
-    style.configure("MetricLabel.TLabel", background=COLOR_SURFACE, foreground=COLOR_MUTED, font=("Segoe UI", 9))
-    style.configure("MetricValue.TLabel", background=COLOR_SURFACE, foreground=COLOR_TEXT, font=("Segoe UI", 11, "bold"))
-    style.configure("AccentText.TLabel", background=COLOR_BG, foreground=COLOR_ACCENT, font=("Segoe UI", 10, "bold"))
+    for name, size, weight, background, foreground in (
+        ("Hero", 30, "bold", COLOR_BG, COLOR_TEXT),
+        ("Title", 24, "bold", COLOR_BG, COLOR_TEXT),
+        ("Subtitle", 11, "normal", COLOR_BG, COLOR_MUTED),
+        ("Small", 9, "normal", COLOR_BG, COLOR_MUTED),
+        ("Card", 11, "normal", COLOR_SURFACE, COLOR_TEXT),
+        ("CardTitle", 14, "bold", COLOR_SURFACE, COLOR_TEXT),
+        ("CardMuted", 10, "normal", COLOR_SURFACE, COLOR_MUTED),
+        ("MetricLabel", 10, "normal", COLOR_SURFACE, COLOR_MUTED),
+        ("MetricValue", 14, "normal", COLOR_SURFACE, COLOR_TEXT),
+        ("AccentText", 11, "normal", COLOR_BG, COLOR_ACCENT),
+        ("Sync", 10, "normal", COLOR_SURFACE, COLOR_SUCCESS),
+        ("Waiting", 10, "normal", COLOR_SURFACE, COLOR_MUTED),
+        ("Lost", 10, "normal", COLOR_SURFACE, COLOR_DANGER),
+        ("Phase", 11, "normal", COLOR_BG, COLOR_ACCENT),
+        ("SuccessPhase", 11, "normal", COLOR_BG, COLOR_SUCCESS),
+        ("WarningPhase", 11, "normal", COLOR_BG, COLOR_WARNING),
+        ("DangerPhase", 11, "normal", COLOR_BG, COLOR_DANGER),
+    ):
+        style.configure(f"{name}.TLabel", font=("Segoe UI", size, weight), background=background, foreground=foreground)
 
-    style.configure("RoleBadge.TLabel", background=COLOR_ACCENT, foreground="#FFFFFF", padding=(12, 5), font=("Segoe UI", 9, "bold"))
-    style.configure("ReceiverBadge.TLabel", background=COLOR_CYAN, foreground=COLOR_BG, padding=(12, 5), font=("Segoe UI", 9, "bold"))
-    style.configure("Sync.TLabel", background=COLOR_SURFACE, foreground=COLOR_SUCCESS, font=("Segoe UI", 12, "bold"))
-    style.configure("Waiting.TLabel", background=COLOR_SURFACE, foreground=COLOR_WARNING, font=("Segoe UI", 12, "bold"))
-    style.configure("Lost.TLabel", background=COLOR_SURFACE, foreground=COLOR_DANGER, font=("Segoe UI", 12, "bold"))
-    style.configure("Phase.TLabel", background=COLOR_ACCENT, foreground="#FFFFFF", padding=(12, 5), font=("Segoe UI", 9, "bold"))
-    style.configure("SuccessPhase.TLabel", background=COLOR_SUCCESS, foreground=COLOR_BG, padding=(12, 5), font=("Segoe UI", 9, "bold"))
-    style.configure("WarningPhase.TLabel", background=COLOR_WARNING, foreground=COLOR_BG, padding=(12, 5), font=("Segoe UI", 9, "bold"))
-    style.configure("DangerPhase.TLabel", background=COLOR_DANGER, foreground="#FFFFFF", padding=(12, 5), font=("Segoe UI", 9, "bold"))
-
-    style.configure(
-        "TButton",
-        background=COLOR_SURFACE_ALT,
-        foreground=COLOR_TEXT,
-        borderwidth=0,
-        focusthickness=0,
-        focuscolor=COLOR_SURFACE_ALT,
-        padding=(14, 9),
-        font=("Segoe UI", 10, "bold"),
-    )
-    style.map(
-        "TButton",
-        background=[("active", COLOR_BORDER), ("pressed", COLOR_PANEL), ("disabled", COLOR_SURFACE)],
-        foreground=[("disabled", "#53627A")],
-    )
-    style.configure("Accent.TButton", background=COLOR_ACCENT, foreground="#FFFFFF")
-    style.map("Accent.TButton", background=[("active", COLOR_ACCENT_HOVER), ("pressed", "#6254E8"), ("disabled", "#34315B")])
-    style.configure("Cyan.TButton", background=COLOR_CYAN, foreground=COLOR_BG)
-    style.map("Cyan.TButton", background=[("active", COLOR_CYAN_HOVER), ("pressed", "#25B5D2")])
-    style.configure("Danger.TButton", background=COLOR_DANGER, foreground="#FFFFFF")
-    style.map("Danger.TButton", background=[("active", COLOR_DANGER_HOVER), ("pressed", "#D95168")])
-    style.configure("Ghost.TButton", background=COLOR_SURFACE, foreground=COLOR_MUTED, padding=(11, 7))
-    style.map("Ghost.TButton", background=[("active", COLOR_SURFACE_ALT)], foreground=[("active", COLOR_TEXT)])
-
-    style.configure(
-        "Card.TLabelframe",
-        background=COLOR_SURFACE,
-        bordercolor=COLOR_BORDER,
-        borderwidth=1,
-        relief="solid",
-    )
-    style.configure(
-        "Card.TLabelframe.Label",
-        background=COLOR_SURFACE,
-        foreground=COLOR_MUTED,
-        font=("Segoe UI", 9, "bold"),
-    )
-    style.configure("Card.TCheckbutton", background=COLOR_SURFACE, foreground=COLOR_MUTED, padding=3)
-    style.map(
-        "Card.TCheckbutton",
-        background=[("active", COLOR_SURFACE)],
-        foreground=[("active", COLOR_TEXT)],
-        indicatorcolor=[("selected", COLOR_ACCENT), ("!selected", COLOR_PANEL)],
-    )
-
-    style.configure(
-        "Modern.Horizontal.TProgressbar",
-        background=COLOR_ACCENT,
-        troughcolor=COLOR_PANEL,
-        bordercolor=COLOR_PANEL,
-        lightcolor=COLOR_ACCENT,
-        darkcolor=COLOR_ACCENT,
-        thickness=10,
-    )
-    style.configure("TNotebook", background=COLOR_BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
-    style.configure("TNotebook.Tab", background=COLOR_SURFACE, foreground=COLOR_MUTED, padding=(16, 9), borderwidth=0)
-    style.map(
-        "TNotebook.Tab",
-        background=[("selected", COLOR_SURFACE_ALT), ("active", COLOR_SURFACE_ALT)],
-        foreground=[("selected", COLOR_TEXT), ("active", COLOR_TEXT)],
-    )
-    style.configure(
-        "Treeview",
-        background=COLOR_PANEL,
-        fieldbackground=COLOR_PANEL,
-        foreground=COLOR_TEXT,
-        bordercolor=COLOR_BORDER,
-        rowheight=29,
-        relief="flat",
-    )
-    style.map("Treeview", background=[("selected", COLOR_ACCENT)], foreground=[("selected", "#FFFFFF")])
-    style.configure(
-        "Treeview.Heading",
-        background=COLOR_SURFACE_ALT,
-        foreground=COLOR_MUTED,
-        bordercolor=COLOR_BORDER,
-        relief="flat",
-        padding=(8, 8),
-        font=("Segoe UI", 9, "bold"),
-    )
-    style.map("Treeview.Heading", background=[("active", COLOR_BORDER)])
-    style.configure("TScrollbar", background=COLOR_SURFACE_ALT, troughcolor=COLOR_PANEL, bordercolor=COLOR_PANEL, arrowcolor=COLOR_MUTED)
-
+    style.configure("TButton", background=COLOR_SURFACE_ALT, foreground=COLOR_TEXT,
+                    padding=(16, 11), borderwidth=0, focusthickness=1, focuscolor=COLOR_ACCENT,
+                    font=("Segoe UI", 11))
+    style.map("TButton", background=[("pressed", COLOR_BORDER), ("active", COLOR_BORDER)],
+              foreground=[("disabled", COLOR_MUTED)])
+    for name in ("Accent", "Cyan"):
+        style.configure(f"{name}.TButton", background=COLOR_ACCENT, foreground="#FFFFFF")
+        style.map(f"{name}.TButton", background=[("disabled", COLOR_SURFACE_ALT),
+                  ("pressed", COLOR_ACCENT_HOVER), ("active", COLOR_ACCENT_HOVER)],
+                  foreground=[("disabled", COLOR_MUTED)])
+    style.configure("Danger.TButton", background=COLOR_SURFACE_ALT, foreground=COLOR_DANGER)
+    style.map("Danger.TButton", background=[("active", COLOR_BORDER)])
+    style.configure("Ghost.TButton", background=COLOR_BG, foreground=COLOR_MUTED, padding=(10, 9))
+    style.map("Ghost.TButton", background=[("active", COLOR_SURFACE_ALT)])
+    style.configure("Link.TButton", background=COLOR_SURFACE, foreground=COLOR_ACCENT, padding=(10, 9))
+    style.map("Link.TButton", background=[("active", COLOR_PANEL)])
+    style.configure("Segment.TButton", background=COLOR_SURFACE_ALT, padding=(24, 10))
+    style.configure("SelectedSegment.TButton", foreground=COLOR_TEXT, padding=(24, 10))
+    style.configure("Role.TButton", font=("Segoe UI", 12), anchor="w", justify="left", padding=(24, 22))
+    style.configure("Card.TCheckbutton", background=COLOR_SURFACE, foreground=COLOR_TEXT, padding=5)
+    style.map("Card.TCheckbutton", background=[("active", COLOR_SURFACE)],
+              indicatorcolor=[("selected", COLOR_ACCENT), ("!selected", COLOR_SURFACE_ALT)])
+    style.configure("Modern.Horizontal.TProgressbar", background=COLOR_ACCENT, troughcolor=COLOR_SURFACE_ALT,
+                    borderwidth=0, bordercolor=COLOR_SURFACE_ALT, lightcolor=COLOR_ACCENT, darkcolor=COLOR_ACCENT,
+                    thickness=6)
+    style.configure("TNotebook", background=COLOR_BG, borderwidth=0, tabmargins=0)
+    style.configure("TNotebook.Tab", background=COLOR_BG, foreground=COLOR_MUTED, padding=(18, 10), borderwidth=0)
+    style.map("TNotebook.Tab", background=[("selected", COLOR_SURFACE)], foreground=[("selected", COLOR_TEXT)])
+    style.configure("Treeview", background=COLOR_SURFACE, fieldbackground=COLOR_SURFACE,
+                    foreground=COLOR_TEXT, borderwidth=0, bordercolor=COLOR_SURFACE, rowheight=34, relief="flat")
+    style.layout("Treeview", [("Treeview.treearea", {"sticky": "nsew"})])
+    style.map("Treeview", background=[("selected", COLOR_SURFACE_ALT)], foreground=[("selected", COLOR_TEXT)])
+    style.configure("Treeview.Heading", background=COLOR_PANEL, foreground=COLOR_MUTED, borderwidth=0,
+                    bordercolor=COLOR_PANEL, lightcolor=COLOR_PANEL, darkcolor=COLOR_PANEL,
+                    relief="flat", padding=(8, 9), font=("Segoe UI", 10))
+    style.configure("TSeparator", background=COLOR_BORDER)
+    style.configure("Vertical.TScrollbar", background=COLOR_BORDER, troughcolor=COLOR_SURFACE,
+                    borderwidth=0, bordercolor=COLOR_SURFACE, lightcolor=COLOR_BORDER, darkcolor=COLOR_BORDER,
+                    width=8, arrowsize=8)
+    style.layout("Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+        ("Vertical.Scrollbar.thumb", {"sticky": "nsew", "expand": True})]})])
+    style.configure("TScrollbar", background=COLOR_BORDER, troughcolor=COLOR_SURFACE, borderwidth=0,
+                    arrowcolor=COLOR_MUTED, arrowsize=8)
+    if not hasattr(root, "button_images"):
+        root.button_images = {}
+    hover = accent_tint(.14)
+    for name, normal, active in (("TButton", COLOR_SURFACE_ALT, hover),
+        ("Card.TButton", COLOR_SURFACE_ALT, hover),
+        ("Accent.TButton", COLOR_ACCENT, COLOR_ACCENT_HOVER),
+        ("Cyan.TButton", COLOR_ACCENT, COLOR_ACCENT_HOVER),
+        ("Danger.TButton", COLOR_SURFACE_ALT, hover),
+        ("Ghost.TButton", COLOR_BG, hover),
+        ("Link.TButton", COLOR_SURFACE, hover),
+        ("Role.TButton", COLOR_SURFACE, hover),
+        ("Segment.TButton", COLOR_SURFACE, hover),
+        ("SelectedSegment.TButton", accent_tint(.32), accent_tint(.4))):
+        background = COLOR_SURFACE if name in ("Link.TButton", "Card.TButton") else COLOR_BG
+        generated = [rounded_button_image(root, color, background) for color in (normal, active, COLOR_SURFACE_ALT)]
+        generated.append(rounded_button_image(root, normal, background, focused=True))
+        if name in root.button_images:
+            images = root.button_images[name]
+            for destination, new in zip(images, generated):
+                destination.tk.call(str(destination), "copy", str(new))
+        else:
+            images = [new.copy() for new in generated]
+            root.button_images[name] = images
+        element = "Rounded" + name
+        if element not in style.element_names():
+            style.element_create(element, "image", str(images[0]), ("disabled", str(images[2])),
+                                 ("pressed", str(images[1])), ("active", str(images[1])),
+                                 ("focus", str(images[3])), border=10, sticky="nsew")
+        style.configure(name, background=background)
+        style.map(name, background=[])
+        if name not in ("Accent.TButton", "Cyan.TButton"):
+            style.map(name, foreground=[("disabled", COLOR_MUTED),
+                      ("active", COLOR_DANGER if name == "Danger.TButton" else COLOR_TEXT)])
+        style.layout(name, [(element, {"sticky": "nsew", "children": [
+            ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})])
+    style.configure("Selected.Ghost.TButton", foreground=COLOR_ACCENT)
 
 @dataclass(frozen=True)
 class EthernetAdapter:
@@ -266,22 +520,84 @@ class EthernetAdapter:
 
 
 @dataclass(frozen=True)
+class WifiAdapter:
+    name: str
+    if_index: int
+    address: str
+    prefix_length: int
+    mac: str = ""
+    link_speed: str = ""
+    rx_bps: int = 0
+    tx_bps: int = 0
+    has_gateway: bool = True
+
+    @property
+    def network(self):
+        return ipaddress.IPv4Network(f"{self.address}/{self.prefix_length}", strict=False)
+
+
+def discover_wifi_adapters() -> list[WifiAdapter]:
+    script = r'''
+$ErrorActionPreference = 'Stop'
+$items = @()
+Get-NetAdapter -Physical | Where-Object {
+    $_.Status -eq 'Up' -and $_.NdisPhysicalMedium -in @(1, 9)
+} | ForEach-Object {
+    $a = $_
+    $ip = Get-NetIPAddress -InterfaceIndex $a.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.AddressState -eq 'Preferred' } | Select-Object -First 1
+    if ($ip) {
+        $items += [PSCustomObject]@{
+            Name = [string]$a.Name; IfIndex = [int]$a.ifIndex
+            Address = [string]$ip.IPAddress; PrefixLength = [int]$ip.PrefixLength
+            Mac = [string]$a.MacAddress; LinkSpeed = [string]$a.LinkSpeed
+            RxBps = [int64]$a.ReceiveLinkSpeed; TxBps = [int64]$a.TransmitLinkSpeed
+        }
+    }
+}
+$items | ConvertTo-Json -Compress
+'''
+    raw = run_powershell(script)
+    if not raw:
+        return []
+    data = json.loads(raw)
+    if isinstance(data, dict):
+        data = [data]
+    return [WifiAdapter(str(x["Name"]), int(x["IfIndex"]), str(x["Address"]), int(x["PrefixLength"]),
+                        str(x.get("Mac", "")), str(x.get("LinkSpeed", "")),
+                        int(x.get("RxBps") or 0), int(x.get("TxBps") or 0)) for x in data]
+
+
+def adapter_endpoint(adapter, port: int, peer_ip: str | None = None):
+    if isinstance(adapter, WifiAdapter):
+        return (peer_ip or adapter.address, port)
+    return ipv6_scope_tuple(peer_ip or adapter.link_local, port, adapter.if_index)
+
+
+def adapter_family(adapter):
+    return socket.AF_INET if isinstance(adapter, WifiAdapter) else socket.AF_INET6
+
+
+@dataclass(frozen=True)
 class TransferItem:
     source: Path
     relative: str
     size: int
+    modified_ns: int
 
 
 @dataclass
 class IncomingTransferDecision:
     ready: threading.Event = field(default_factory=threading.Event)
     destination: Path | None = None
+    owner: int = 0
     reason: str = "Transfer declined by the receiver."
 
-    def accept(self, destination: Path) -> None:
+    def accept(self, destination: Path, owner: int = 0) -> None:
         if self.ready.is_set():
             return
         self.destination = destination
+        self.owner = owner
         self.ready.set()
 
     def reject(self, reason: str = "Transfer declined by the receiver.") -> None:
@@ -296,6 +612,10 @@ class TransferCancelled(RuntimeError):
 
 
 class TransferRejected(RuntimeError):
+    pass
+
+
+class TransferInterrupted(ConnectionError):
     pass
 
 
@@ -585,12 +905,19 @@ def download_update(release: dict, events: queue.Queue) -> Path:
         downloaded = staging / RELEASE_ASSET
         digest = hashlib.sha256()
         done = 0
+        last_progress = time.monotonic()
+        last_done = 0
+        events.put(("update_progress", 0, asset["size"], 0.0))
         with urlopen(request, timeout=30) as response, downloaded.open("wb") as output:
-            while block := response.read(1024 * 1024):
+            while block := response.read(64 * 1024):
                 output.write(block)
                 digest.update(block)
                 done += len(block)
-                events.put(("update_progress", done, asset["size"]))
+                now = time.monotonic()
+                if now - last_progress >= 0.25 or done == asset["size"]:
+                    speed = (done - last_done) / max(now - last_progress, 0.001)
+                    events.put(("update_progress", done, asset["size"], speed))
+                    last_progress, last_done = now, done
         if done != asset["size"] or done == 0:
             raise RuntimeError("The update download is incomplete. Please try again.")
         expected_digest = asset.get("digest")
@@ -645,6 +972,7 @@ def launch_updater(staging: Path) -> None:
     )
     subprocess.Popen(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", str(script)],
+        env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
         creationflags=subprocess.CREATE_NO_WINDOW,
         cwd=str(target.parent),
     )
@@ -734,10 +1062,11 @@ def ipv6_scope_tuple(ip: str, port: int, if_index: int) -> tuple[str, int, int, 
     return (ip, port, 0, if_index)
 
 
-def configure_stream_socket(sock: socket.socket) -> None:
+def configure_stream_socket(sock: socket.socket, automatic_buffers: bool = False) -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER)
+    if not automatic_buffers:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
@@ -793,11 +1122,9 @@ def recv_frame(sock: socket.socket) -> dict:
 
 def safe_relative_path(value: str) -> Path:
     p = PurePosixPath(value)
-    if p.is_absolute() or not p.parts:
+    if "\\" in value or ":" in value or p.is_absolute() or not p.parts:
         raise ValueError("Unsafe file path.")
     if any(part in ("", ".", "..") for part in p.parts):
-        raise ValueError("Unsafe file path.")
-    if ":" in p.parts[0]:
         raise ValueError("Unsafe file path.")
     return Path(*p.parts)
 
@@ -812,6 +1139,204 @@ def unique_transfer_root(base: Path, peer_name: str) -> Path:
         n += 1
     candidate.mkdir(parents=True, exist_ok=False)
     return candidate
+
+
+def windows_move_transfer(source: Path, destination: Path, cancel_event: threading.Event,
+                          owner: int, created: set[Path]) -> None:
+    """Let the Windows shell merge folders and ask about conflicting files."""
+    pointer, word, text = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p
+    ole32, shell32 = ctypes.windll.ole32, ctypes.windll.shell32
+    ole32.CoInitializeEx.argtypes = [pointer, word]
+    ole32.CoCreateInstance.argtypes = [pointer, pointer, word, pointer, pointer]
+    ole32.CoTaskMemFree.argtypes = [pointer]
+    shell32.SHCreateItemFromParsingName.argtypes = [text, pointer, pointer, pointer]
+
+    def guid(value):
+        return ctypes.create_string_buffer(uuid.UUID(value).bytes_le, 16)
+
+    def call(item, index, types=(), *args):
+        table = ctypes.cast(item, ctypes.POINTER(ctypes.POINTER(pointer))).contents
+        method = ctypes.WINFUNCTYPE(ctypes.c_long, pointer, *types)(table[index])
+        return method(item, *args)
+
+    def check(result):
+        if result < 0:
+            if result & 0xFFFFFFFF in (0x80004004, 0x800704C7, 0x80270000):
+                raise TransferCancelled("Transfer cancelled while saving files.")
+            raise ctypes.WinError(result)
+
+    def item_path(item):
+        name = pointer()
+        check(call(item, 5, (word, pointer), 0x80058000, ctypes.byref(name)))  # SIGDN_FILESYSPATH
+        try:
+            return Path(ctypes.wstring_at(name))
+        finally:
+            ole32.CoTaskMemFree(name)
+
+    def shell_item(path):
+        item = pointer()
+        check(shell32.SHCreateItemFromParsingName(str(path), None, shell_iid, ctypes.byref(item)))
+        return item
+
+    existing = set()
+    for path in source.rglob("*"):
+        target = destination / path.relative_to(source)
+        if target.exists():
+            existing.add(target)
+        else:
+            created.add(target)
+
+    errors, skipped = [], []
+    references = [1]
+    sink_iid = uuid.UUID("04b0f1a7-9490-44bc-96e1-4296a31252e2").bytes_le
+    unknown_iid = uuid.UUID("00000000-0000-0000-c000-000000000046").bytes_le
+
+    def query(this, iid, output):
+        if ctypes.string_at(iid, 16) not in (unknown_iid, sink_iid):
+            output[0] = None
+            return -2147467262  # E_NOINTERFACE
+        output[0] = this
+        references[0] += 1
+        return 0
+
+    def add_ref(this):
+        references[0] += 1
+        return references[0]
+
+    def release(this):
+        references[0] -= 1
+        return references[0]
+
+    def progress(*args):
+        return -2147467260 if cancel_event.is_set() else 0  # E_ABORT
+
+    def finish(this, result):
+        if result < 0:
+            errors.append(result)
+        return 0
+
+    def moved(this, flags, item, folder, name, result, new_item):
+        if result < 0:
+            errors.append(result)
+        elif result == 0x00270005:  # COPYENGINE_S_USER_IGNORED
+            skipped.append(item)
+        elif new_item:
+            try:
+                path = item_path(new_item)
+                path.resolve().relative_to(destination)
+                if path not in existing:
+                    created.add(path)
+                    if path.is_dir():
+                        created.update(path.rglob("*"))
+            except Exception:
+                return -2147467259  # E_FAIL
+        return progress()
+
+    # IFileOperationProgressSink, in COM vtable order. Unused notifications are no-ops.
+    signatures = [
+        (query, (pointer, ctypes.POINTER(pointer))), (add_ref, ()), (release, ()),
+        (progress, ()), (finish, (ctypes.c_long,)),
+        (progress, (word, pointer, text)), (progress, (word, pointer, text, ctypes.c_long, pointer)),
+        (progress, (word, pointer, pointer, text)),
+        (moved, (word, pointer, pointer, text, ctypes.c_long, pointer)),
+        (progress, (word, pointer, pointer, text)),
+        (progress, (word, pointer, pointer, text, ctypes.c_long, pointer)),
+        (progress, (word, pointer)), (progress, (word, pointer, ctypes.c_long, pointer)),
+        (progress, (word, pointer, text)),
+        (progress, (word, pointer, text, text, word, ctypes.c_long, pointer)),
+        (progress, (word, word)), (progress, ()), (progress, ()), (progress, ()),
+    ]
+    callbacks = [ctypes.WINFUNCTYPE(ctypes.c_long, pointer, *types)(callback)
+                 for callback, types in signatures]
+    table = (pointer * len(callbacks))(*(ctypes.cast(callback, pointer).value for callback in callbacks))
+    sink = ctypes.pointer(ctypes.cast(table, pointer))
+    operation, folder = pointer(), pointer()
+    shell_iid = guid("43826d1e-e718-42ee-bc55-a1e261c37bfe")
+    finished = threading.Event()
+    thread_id = ctypes.windll.kernel32.GetCurrentThreadId()
+
+    def close_cancelled_dialogs():
+        user32 = ctypes.windll.user32
+        window_callback = ctypes.WINFUNCTYPE(ctypes.c_int, pointer, ctypes.c_ssize_t)
+        user32.EnumThreadWindows.argtypes = [word, window_callback, ctypes.c_ssize_t]
+        user32.IsWindowVisible.argtypes = [pointer]
+        user32.PostMessageW.argtypes = [pointer, word, ctypes.c_size_t, ctypes.c_ssize_t]
+
+        def close_window(window, context):
+            if user32.IsWindowVisible(window):
+                user32.PostMessageW(window, 0x0010, 0, 0)  # WM_CLOSE, like Cancel in the shell dialog
+            return 1
+
+        callback = window_callback(close_window)
+        while not finished.wait(0.1):
+            if cancel_event.is_set():
+                user32.EnumThreadWindows(thread_id, callback, 0)
+
+    check(ole32.CoInitializeEx(None, 2))  # COINIT_APARTMENTTHREADED
+    try:
+        check(ole32.CoCreateInstance(guid("3ad05575-8857-4850-9277-11b85bdb8e09"), None, 1,
+                                    guid("947aab5f-0a5c-4c13-b4d6-4bf7836fc9f8"), ctypes.byref(operation)))
+        check(call(operation, 5, (word,), 0x0004 | 0x0200))  # FOF_SILENT | FOF_NOCONFIRMMKDIR
+        check(call(operation, 9, (pointer,), owner))
+        cookie = word()
+        check(call(operation, 3, (pointer, pointer), sink, ctypes.byref(cookie)))
+        folder = shell_item(destination)
+        for path in source.iterdir():
+            if cancel_event.is_set():
+                raise TransferCancelled("Transfer cancelled while saving files.")
+            item = shell_item(path)
+            try:
+                check(call(operation, 14, (pointer, pointer, text, pointer), item, folder, None, None))
+            finally:
+                call(item, 2)
+        threading.Thread(target=close_cancelled_dialogs, daemon=True).start()
+        result = call(operation, 21)
+        aborted = ctypes.c_int()
+        check(call(operation, 22, (pointer,), ctypes.byref(aborted)))
+        for error in errors:
+            check(error)
+        check(result)
+        if cancel_event.is_set() or (aborted.value and not skipped):
+            raise TransferCancelled("Transfer cancelled while saving files.")
+    finally:
+        finished.set()
+        if folder:
+            call(folder, 2)
+        if operation:
+            call(operation, 2)
+        ole32.CoUninitialize()
+
+
+class ReceivedOutput:
+    def __init__(self, destination: Path, peer_name: str, wrap: bool):
+        self.destination = destination.resolve()
+        self.root = unique_transfer_root(self.destination, peer_name) if wrap else self.destination
+        self.data_root = self.root if wrap else Path(tempfile.mkdtemp(prefix=".etherdrop-transfer-", dir=self.destination))
+        self.created: set[Path] = set()
+        self.wrap = wrap
+
+    def save(self, cancel_event: threading.Event, owner: int) -> None:
+        if not self.wrap:
+            windows_move_transfer(self.data_root, self.destination, cancel_event, owner, self.created)
+            self._remove_staging()
+
+    def _remove_staging(self) -> None:
+        path = self.data_root.resolve()
+        if path.parent != self.destination:
+            raise ValueError("Transfer output is outside the chosen destination.")
+        if path.exists():
+            shutil.rmtree(path)
+
+    def cancel(self) -> None:
+        self._remove_staging()
+        for path in sorted(self.created, key=lambda value: len(value.parts), reverse=True):
+            resolved = path.resolve()
+            if resolved == self.destination or not resolved.is_relative_to(self.destination):
+                raise ValueError("Transfer output is outside the chosen destination.")
+            if path.is_dir():
+                path.rmdir()
+            elif path.exists():
+                path.unlink()
 
 
 def build_transfer_items(
@@ -841,8 +1366,9 @@ def build_transfer_items(
         root_name = unique_root_name(selected.name)
 
         if selected.is_file():
-            size = selected.stat().st_size
-            items.append(TransferItem(selected, PurePosixPath(root_name).as_posix(), size))
+            info = selected.stat()
+            size = info.st_size
+            items.append(TransferItem(selected, PurePosixPath(root_name).as_posix(), size, info.st_mtime_ns))
             total += size
             continue
 
@@ -858,12 +1384,13 @@ def build_transfer_items(
                     try:
                         if src.is_symlink() or not src.is_file():
                             continue
-                        size = src.stat().st_size
+                        info = src.stat()
+                        size = info.st_size
                     except OSError:
                         continue
                     rel = src.relative_to(selected)
                     remote = PurePosixPath(root_name, *rel.parts).as_posix()
-                    items.append(TransferItem(src, remote, size))
+                    items.append(TransferItem(src, remote, size, info.st_mtime_ns))
                     total += size
 
     return items, total
@@ -965,6 +1492,162 @@ class DiscoveryService:
                     pass
 
 
+class WifiDiscoveryService(DiscoveryService):
+    def __init__(self, adapter, events, role):
+        super().__init__(adapter, events, role)
+        self.peers = {}
+        self.token = uuid.uuid4().hex
+
+    def _accept_announcement(self, msg, source_ip, now):
+        if (msg.get("magic") != MAGIC or msg.get("version") != PROTOCOL_VERSION
+                or msg.get("mode") != "wifi" or msg.get("session") == SESSION_ID
+                or msg.get("role") not in ("sender", "receiver") or msg.get("role") == self.role
+                or not isinstance(msg.get("session"), str) or not msg["session"]
+                or ipaddress.ip_address(source_ip) not in self.adapter.network):
+            return
+        session = msg["session"]
+        name = str(msg.get("hostname") or "Other laptop")
+        self.peers[session] = (name, source_ip, msg["role"], now)
+        self.events.put(("wifi_peer", self.token, session, name, source_ip, msg["role"]))
+
+    def _expire_peers(self, now):
+        for session, peer in list(self.peers.items()):
+            if now - peer[3] > PEER_TIMEOUT:
+                del self.peers[session]
+                self.events.put(("wifi_peer_lost", self.token, session))
+
+    def _run(self):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                # Windows receives subnet broadcasts on a wildcard listener. Outgoing
+                # broadcasts use a separate socket bound to the selected interface.
+                sock.bind(("", DISCOVERY_PORT))
+                sock.settimeout(0.25)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as announce:
+                    announce.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    announce.bind((self.adapter.address, 0))
+                    last = 0.0
+                    while not self.stop_event.is_set():
+                        now = time.monotonic()
+                        if now - last >= ANNOUNCE_INTERVAL:
+                            payload = json.dumps({"magic": MAGIC, "version": PROTOCOL_VERSION,
+                                "mode": "wifi", "session": SESSION_ID, "hostname": socket.gethostname(),
+                                "role": self.role, "transfer_port": TRANSFER_PORT}).encode("utf-8")
+                            announce.sendto(payload, (str(self.adapter.network.broadcast_address), DISCOVERY_PORT))
+                            last = now
+                        try:
+                            data, addr = sock.recvfrom(4096)
+                            self._accept_announcement(json.loads(data.decode("utf-8")), addr[0], now)
+                        except socket.timeout:
+                            pass
+                        except (ValueError, TypeError, AttributeError):
+                            pass
+                        self._expire_peers(time.monotonic())
+        except OSError as exc:
+            if not self.stop_event.is_set():
+                self.events.put(("wifi_discovery_error", self.token, str(exc)))
+
+
+def close_transfer_socket(sock: socket.socket) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    sock.close()
+
+
+class TransferChannel:
+    """Heartbeats keep approval and Windows dialogs separate from a lost connection."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self.sock.settimeout(TRANSFER_TIMEOUT)
+        self.send_lock = threading.Lock()
+        self.closed = threading.Event()
+        threading.Thread(target=self._heartbeat, daemon=True, name="transfer-heartbeat").start()
+
+    def send(self, payload: dict) -> None:
+        with self.send_lock:
+            try:
+                send_frame(self.sock, payload)
+            except OSError as exc:
+                raise TransferInterrupted(str(exc)) from exc
+
+    def receive(self) -> dict:
+        while True:
+            try:
+                payload = recv_frame(self.sock)
+            except OSError as exc:
+                raise TransferInterrupted(str(exc)) from exc
+            if payload.get("type") != "ping":
+                return payload
+
+    def send_bytes(self, block) -> None:
+        try:
+            self.sock.sendall(block)
+        except OSError as exc:
+            raise TransferInterrupted(str(exc)) from exc
+
+    def receive_bytes(self, block) -> int:
+        try:
+            got = self.sock.recv_into(block)
+        except OSError as exc:
+            raise TransferInterrupted(str(exc)) from exc
+        if not got:
+            raise TransferInterrupted("Connection closed unexpectedly.")
+        return got
+
+    def send_file_frame(self, payload: dict) -> None:
+        # The caller holds send_lock across metadata, file data, and the hash trailer.
+        try:
+            send_frame(self.sock, payload)
+        except OSError as exc:
+            raise TransferInterrupted(str(exc)) from exc
+
+    def _heartbeat(self) -> None:
+        while not self.closed.wait(TRANSFER_HEARTBEAT_INTERVAL):
+            # File data holds this lock, so a heartbeat never enters the byte stream.
+            if not self.send_lock.acquire(timeout=0.1):
+                continue
+            try:
+                send_frame(self.sock, {"type": "ping"})
+            except OSError:
+                self.close()
+                return
+            finally:
+                self.send_lock.release()
+
+    def close(self) -> None:
+        self.closed.set()
+        close_transfer_socket(self.sock)
+
+
+@dataclass
+class IncomingTransfer:
+    offer: dict
+    peer_ip: str
+    decision: IncomingTransferDecision = field(default_factory=IncomingTransferDecision)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    output: ReceivedOutput | None = None
+    index: int = 0
+    offset: int = 0
+    done: int = 0
+    current: dict | None = None
+    hasher: object = None
+    saved_files: dict = field(default_factory=dict)
+    started: float = 0.0
+    result: dict | None = None
+    cancel_reason: str = "Transfer cancelled by the receiver."
+    aborted: bool = False
+
+    @property
+    def transfer_id(self) -> str:
+        return self.offer["transfer_id"]
+
+
 class ReceiverService:
     def __init__(self, adapter: EthernetAdapter, events: queue.Queue, coordinator: threading.Lock):
         self.adapter = adapter
@@ -974,6 +1657,7 @@ class ReceiverService:
         self.server_socket: socket.socket | None = None
         self.thread: threading.Thread | None = None
         self.state_lock = threading.Lock()
+        self.session: IncomingTransfer | None = None
         self.active_transfer_id: str | None = None
         self.active_socket: socket.socket | None = None
         self.active_cancel: threading.Event | None = None
@@ -988,49 +1672,80 @@ class ReceiverService:
         self.stop_event.set()
         self.cancel()
         if self.server_socket:
-            try:
-                self.server_socket.close()
-            except OSError:
-                pass
+            self.server_socket.close()
+
+    def _request_cancel(self, session: IncomingTransfer, reason: str) -> None:
+        session.cancel_reason = reason
+        session.cancel_event.set()
+        session.decision.reject(reason)
+        with self.state_lock:
+            conn = self.active_socket if self.session is session else None
+            send_lock = self.active_send_lock
+        if conn:
+            if send_lock and send_lock.acquire(blocking=False):
+                try:
+                    send_frame(conn, {"type": "cancel", "reason": reason})
+                except OSError:
+                    pass
+                finally:
+                    send_lock.release()
+            close_transfer_socket(conn)
 
     def cancel(self, transfer_id: str | None = None) -> None:
         with self.state_lock:
-            if transfer_id and transfer_id != self.active_transfer_id:
-                return
-            cancel_event = self.active_cancel
-            decision = self.active_decision
-            conn = self.active_socket
-            send_lock = self.active_send_lock
-        if cancel_event:
-            cancel_event.set()
-        if decision:
-            decision.reject("Transfer cancelled by the receiver.")
-        if conn:
-            try:
-                if send_lock:
-                    with send_lock:
-                        send_frame(conn, {"type": "cancel", "reason": "Transfer cancelled by the receiver."})
-                else:
-                    send_frame(conn, {"type": "cancel", "reason": "Transfer cancelled by the receiver."})
-            except OSError:
-                pass
-            try:
-                conn.shutdown(socket.SHUT_RD)
-            except OSError:
-                pass
+            session = self.session
+        if not session or session.result or (transfer_id and transfer_id != session.transfer_id):
+            return
+        self._request_cancel(session, "Transfer cancelled by the receiver.")
+
+        def cleanup():
+            with session.lock:
+                self._finish_cancel(session)
+
+        # Cleanup also runs when the receiver is paused, with no connection worker.
+        threading.Thread(target=cleanup, name="transfer-cleanup").start()
+
+    def _finish(self, session: IncomingTransfer, result: dict, action: str, **details) -> None:
+        if session.result:
+            return
+        session.result = result
+        with self.state_lock:
+            self.active_transfer_id = None
+            self.active_cancel = None
+            self.active_decision = None
+        self.coordinator.release()
+        emit_transfer(self.events, session.transfer_id, action, **details)
+
+    def _finish_cancel(self, session: IncomingTransfer) -> None:
+        if session.result:
+            return
+        try:
+            if session.output:
+                session.output.cancel()
+        except Exception as exc:
+            output = session.output
+            message = f"{session.cancel_reason} Could not remove the new output: {exc}"
+            self._finish(session, {"type": "error", "reason": message}, "failed",
+                         message=message, error_type=type(exc).__name__, cleanup="Incomplete",
+                         destination=str(output.data_root if output.data_root.exists() else output.root))
+        else:
+            self._finish(session, {"type": "error" if session.aborted else "cancel", "reason": session.cancel_reason},
+                         "failed" if session.aborted else "cancelled",
+                         message=session.cancel_reason,
+                         cleanup="New transfer output removed" if session.output else "No output created")
 
     def _run(self) -> None:
         srv = None
         try:
-            srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            srv = socket.socket(adapter_family(self.adapter), socket.SOCK_STREAM)
             self.server_socket = srv
-            srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            if not isinstance(self.adapter, WifiAdapter):
+                srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
             srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            configure_stream_socket(srv)
-            srv.bind(ipv6_scope_tuple(self.adapter.link_local, TRANSFER_PORT, self.adapter.if_index))
+            configure_stream_socket(srv, automatic_buffers=isinstance(self.adapter, WifiAdapter))
+            srv.bind(adapter_endpoint(self.adapter, TRANSFER_PORT))
             srv.listen(2)
             srv.settimeout(0.5)
-
             while not self.stop_event.is_set():
                 try:
                     conn, addr = srv.accept()
@@ -1040,275 +1755,260 @@ class ReceiverService:
                     if self.stop_event.is_set():
                         break
                     raise
-
-                threading.Thread(
-                    target=self._handle_connection,
-                    args=(conn, addr),
-                    daemon=True,
-                    name="incoming-transfer",
-                ).start()
-
+                threading.Thread(target=self._handle_connection, args=(conn, addr),
+                                 daemon=True, name="incoming-transfer").start()
         except Exception as exc:
             if not self.stop_event.is_set():
                 self.events.put(("error", f"Receiver failed: {exc}"))
         finally:
             if srv:
-                try:
-                    srv.close()
-                except OSError:
-                    pass
+                srv.close()
 
     def _handle_connection(self, conn: socket.socket, addr) -> None:
-        configure_stream_socket(conn)
-        acquired = False
-        transfer_id = ""
-        transfer_root: Path | None = None
-        cancel_event = threading.Event()
-        send_lock = threading.Lock()
-
-        def send_reply(payload: dict) -> None:
-            with send_lock:
-                send_frame(conn, payload)
-
+        configure_stream_socket(conn, automatic_buffers=isinstance(self.adapter, WifiAdapter))
+        channel = TransferChannel(conn)
+        session = None
         try:
-            offer = recv_frame(conn)
-            if offer.get("magic") != MAGIC or offer.get("type") != "offer":
-                raise ValueError("Invalid EtherDrop connection.")
-
+            offer = channel.receive()
+            if offer.get("magic") != MAGIC or offer.get("version") != PROTOCOL_VERSION:
+                raise ValueError("Both laptops need the same EtherDrop version.")
             transfer_id = str(offer.get("transfer_id") or "")
             if not transfer_id:
                 raise ValueError("Missing transfer identifier.")
-
-            if not self.coordinator.acquire(blocking=False):
-                send_frame(conn, {"type": "reject", "reason": "This laptop is already handling another transfer."})
-                return
-            acquired = True
-
-            peer_name = str(offer.get("hostname") or "Other laptop")
             peer_ip = str(addr[0]).split("%")[0]
-            verify = bool(offer.get("verify"))
-            expected_total = int(offer.get("total_bytes") or 0)
-            file_count = int(offer.get("file_count") or 0)
-            roots = [str(value) for value in offer.get("roots", [])]
-            decision = IncomingTransferDecision()
-
             with self.state_lock:
-                self.active_transfer_id = transfer_id
-                self.active_socket = conn
-                self.active_cancel = cancel_event
-                self.active_decision = decision
-                self.active_send_lock = send_lock
+                existing = self.session
+                matched = existing and existing.transfer_id == transfer_id and existing.peer_ip == peer_ip
+                if offer.get("type") in ("cancel", "abort"):
+                    session = existing if matched else None
+                elif offer.get("type") != "offer":
+                    raise ValueError("Invalid EtherDrop connection.")
+                elif matched:
+                    if any(offer.get(key) != existing.offer.get(key)
+                           for key in ("manifest", "total_bytes", "file_count", "verify", "wrap")):
+                        raise ValueError("The transfer contents have changed.")
+                    session = existing
+                elif offer.get("resume"):
+                    channel.send({"type": "reject", "reason": "This transfer is no longer available. Send it again."})
+                    return
+                elif self.stop_event.is_set() or not self.coordinator.acquire(blocking=False):
+                    channel.send({"type": "reject", "reason": "This laptop is already handling another transfer."})
+                    return
+                else:
+                    session = self.session = IncomingTransfer(offer, peer_ip)
+                    self.active_transfer_id = transfer_id
+                    self.active_cancel = session.cancel_event
+                    self.active_decision = session.decision
+                    emit_transfer(self.events, transfer_id, "incoming_offer",
+                                  peer=offer.get("hostname") or "Other laptop", peer_ip=peer_ip,
+                                  total=offer["total_bytes"], file_count=offer["file_count"],
+                                  verify=offer["verify"], wrap=offer.get("wrap", True),
+                                  roots=offer.get("roots", []), decision=session.decision)
 
-            emit_transfer(
-                self.events,
-                transfer_id,
-                "incoming_offer",
-                peer=peer_name,
-                peer_ip=peer_ip,
-                total=expected_total,
-                file_count=file_count,
-                verify=verify,
-                roots=roots,
-                decision=decision,
-            )
-
-            while not decision.ready.wait(0.2):
-                if self.stop_event.is_set() or cancel_event.is_set():
-                    raise TransferCancelled("Transfer cancelled while waiting for a destination.")
-                readable, _, _ = select.select([conn], [], [], 0)
-                if readable and conn.recv(1, socket.MSG_PEEK) == b"":
-                    raise TransferCancelled("The sender cancelled before a destination was selected.")
-
-            if cancel_event.is_set():
-                raise TransferCancelled("Transfer cancelled by the receiver.")
-            if decision.destination is None:
-                send_reply({"type": "reject", "reason": decision.reason})
-                emit_transfer(self.events, transfer_id, "rejected", message=decision.reason)
+            if offer.get("type") in ("cancel", "abort"):
+                if session:
+                    session.aborted = offer["type"] == "abort"
+                    self._request_cancel(session, str(offer.get("reason") or "Transfer cancelled by the sender."))
+                    with session.lock:
+                        self._finish_cancel(session)
+                        channel.send(session.result)
+                else:
+                    channel.send({"type": "cancel", "reason": "No output created."})
                 return
 
-            destination = decision.destination.resolve()
-            destination.mkdir(parents=True, exist_ok=True)
-            transfer_root = unique_transfer_root(destination, peer_name)
-            disk = shutil.disk_usage(destination)
-            storage = {
-                "Receiver volume total": f"{human_bytes(disk.total)} ({disk.total} bytes)",
-                "Receiver volume free before transfer": f"{human_bytes(disk.free)} ({disk.free} bytes)",
-                "Receiver free space after payload (estimated)": (
-                    f"{human_bytes(disk.free - expected_total)} ({disk.free - expected_total} bytes)"
-                ),
-            }
-            send_reply(
-                {
-                    "type": "accept",
-                    "destination": str(transfer_root),
-                    "disk_total": disk.total,
-                    "disk_free": disk.free,
-                },
-            )
-            emit_transfer(
-                self.events,
-                transfer_id,
-                "start",
-                direction="Receiving",
-                peer=peer_name,
-                peer_ip=peer_ip,
-                total=expected_total,
-                file_count=file_count,
-                verify=verify,
-                destination=str(transfer_root),
-                socket=socket_diagnostics(conn),
-                storage=storage,
-            )
-
-            received_total = 0
-            started = time.monotonic()
-            reusable = bytearray(BLOCK_SIZE)
-            view = memoryview(reusable)
-
-            for file_index in range(1, file_count + 1):
-                if cancel_event.is_set():
-                    raise TransferCancelled("Transfer cancelled by the receiver.")
-
-                meta = recv_frame(conn)
-                if meta.get("type") != "file":
-                    raise ValueError("Expected file metadata.")
-
-                rel = safe_relative_path(str(meta["path"]))
-                size = int(meta["size"])
-                if size < 0:
-                    raise ValueError("Invalid file size.")
-
-                dest = transfer_root / rel
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                emit_transfer(
-                    self.events,
-                    transfer_id,
-                    "file_start",
-                    index=file_index,
-                    file_count=file_count,
-                    path=rel.as_posix(),
-                    destination=str(dest),
-                    size=size,
-                )
-
-                hasher = hashlib.sha256() if verify else None
-                remaining = size
-                file_done = 0
-                last_progress = 0.0
-                with open(dest, "wb", buffering=0) as f:
-                    while remaining:
-                        if cancel_event.is_set():
-                            raise TransferCancelled("Transfer cancelled by the receiver.")
-                        wanted = min(BLOCK_SIZE, remaining)
-                        filled = 0
-
-                        while filled < wanted:
-                            got = conn.recv_into(view[filled:wanted])
-                            if got == 0:
-                                raise TransferCancelled("The sender cancelled during file data.")
-                            filled += got
-
-                        block = view[:filled]
-                        f.write(block)
-                        if hasher:
-                            hasher.update(block)
-
-                        remaining -= filled
-                        file_done += filled
-                        received_total += filled
-
-                        now = time.monotonic()
-                        if now - last_progress >= 0.10:
-                            emit_transfer(
-                                self.events,
-                                transfer_id,
-                                "progress",
-                                done=received_total,
-                                total=expected_total,
-                                current_file_done=file_done,
-                                current_file_size=size,
-                                current=rel.as_posix(),
-                            )
-                            last_progress = now
-
-                digest = ""
-                if verify:
-                    trailer = recv_frame(conn)
-                    if trailer.get("type") != "hash":
-                        raise ValueError("Missing hash trailer.")
-                    digest = hasher.hexdigest()
-                    expected = str(trailer.get("sha256") or "")
-                    if digest.lower() != expected.lower():
-                        try:
-                            dest.unlink()
-                        except OSError:
-                            pass
-                        raise IOError(f"SHA-256 verification failed for {rel.as_posix()}")
-
-                send_reply({"type": "file_ok"})
-                emit_transfer(
-                    self.events,
-                    transfer_id,
-                    "file_done",
-                    index=file_index,
-                    path=rel.as_posix(),
-                    size=size,
-                    sha256=digest,
-                )
-
-            final = recv_frame(conn)
-            if final.get("type") != "done":
-                raise ValueError("Transfer did not end correctly.")
-            send_reply({"type": "done_ok"})
-
-            elapsed = max(time.monotonic() - started, 0.001)
-            emit_transfer(
-                self.events,
-                transfer_id,
-                "done",
-                done=received_total,
-                average_bps=received_total / elapsed,
-                destination=str(transfer_root),
-            )
-
-        except TransferCancelled as exc:
-            if transfer_id:
-                emit_transfer(
-                    self.events,
-                    transfer_id,
-                    "cancelled",
-                    message=str(exc),
-                    destination=str(transfer_root) if transfer_root else "Not created",
-                )
+            with session.lock:
+                if session.result:
+                    channel.send(session.result)
+                    return
+                with self.state_lock:
+                    self.active_socket = conn
+                    self.active_send_lock = channel.send_lock
+                try:
+                    self._receive_transfer(channel, session)
+                except TransferInterrupted:
+                    if session.cancel_event.is_set():
+                        self._finish_cancel(session)
+                    elif not session.result:
+                        emit_transfer(self.events, transfer_id, "paused", done=session.done,
+                                      total=offer["total_bytes"], message="Connection interrupted. Waiting to reconnect — keep both apps open.")
+                except TransferCancelled:
+                    self._finish_cancel(session)
+                    try:
+                        channel.send(session.result)
+                    except OSError:
+                        pass
+                except Exception as exc:
+                    if session.cancel_event.is_set():
+                        self._finish_cancel(session)
+                    else:
+                        self._finish(session, {"type": "error", "reason": str(exc)}, "failed",
+                                     message=str(exc), error_type=type(exc).__name__,
+                                     destination=str(session.output.data_root) if session.output else "Not created")
+                    try:
+                        channel.send(session.result)
+                    except OSError:
+                        pass
         except Exception as exc:
-            if transfer_id:
-                peer_ended = isinstance(exc, ConnectionError) and str(exc) == "Connection closed unexpectedly."
-                action = "cancelled" if cancel_event.is_set() or peer_ended else "failed"
-                message = "The sender cancelled or cleanly closed the transfer." if peer_ended else str(exc)
-                emit_transfer(
-                    self.events,
-                    transfer_id,
-                    action,
-                    message=message,
-                    error_type=type(exc).__name__,
-                    destination=str(transfer_root) if transfer_root else "Not created",
-                )
-            elif not self.stop_event.is_set():
-                self.events.put(("error", f"Incoming connection failed: {exc}"))
-        finally:
-            with self.state_lock:
-                if self.active_transfer_id == transfer_id:
-                    self.active_transfer_id = None
-                    self.active_socket = None
-                    self.active_cancel = None
-                    self.active_decision = None
-                    self.active_send_lock = None
+            if session and not session.result:
+                with session.lock:
+                    if session.cancel_event.is_set():
+                        self._finish_cancel(session)
+                    else:
+                        self._finish(session, {"type": "error", "reason": str(exc)}, "failed",
+                                     message=str(exc), error_type=type(exc).__name__,
+                                     destination=str(session.output.data_root) if session.output else "Not created")
             try:
-                conn.close()
+                channel.send({"type": "error", "reason": str(exc)})
             except OSError:
                 pass
-            if acquired:
-                self.coordinator.release()
+        finally:
+            with self.state_lock:
+                if self.active_socket is conn:
+                    self.active_socket = None
+                    self.active_send_lock = None
+            channel.close()
+
+    def _receive_transfer(self, channel: TransferChannel, session: IncomingTransfer) -> None:
+        offer, decision = session.offer, session.decision
+        tid = session.transfer_id
+        verify = bool(offer["verify"])
+        count, total = int(offer["file_count"]), int(offer["total_bytes"])
+        while not decision.ready.wait(0.2):
+            if session.cancel_event.is_set():
+                raise TransferCancelled(session.cancel_reason)
+            readable, _, _ = select.select([channel.sock], [], [], 0)
+            if readable:
+                try:
+                    pending = recv_frame(channel.sock)
+                except OSError as exc:
+                    raise TransferInterrupted(str(exc)) from exc
+                if pending.get("type") != "ping":
+                    raise ValueError("Expected receiver approval.")
+        if session.cancel_event.is_set():
+            raise TransferCancelled(session.cancel_reason)
+        if decision.destination is None:
+            self._finish(session, {"type": "reject", "reason": decision.reason}, "rejected", message=decision.reason)
+            channel.send(session.result)
+            return
+
+        resumed = session.output is not None
+        if not resumed:
+            destination = decision.destination.resolve()
+            destination.mkdir(parents=True, exist_ok=True)
+            session.output = ReceivedOutput(destination, str(offer.get("hostname") or "Other laptop"), bool(offer.get("wrap", True)))
+            session.started = time.monotonic()
+        output = session.output
+        if resumed:
+            for relative, signature in session.saved_files.items():
+                info = (output.data_root / relative).stat()
+                if (info.st_size, info.st_mtime_ns) != signature:
+                    raise RuntimeError(f"Received file changed during interruption: {relative}. Send the transfer again.")
+        disk = shutil.disk_usage(output.destination)
+        emit_transfer(self.events, tid, "resumed" if resumed else "start", direction="Receiving",
+                      peer=offer.get("hostname"), peer_ip=session.peer_ip, total=total, file_count=count,
+                      verify=verify, wrap=output.wrap, destination=str(output.root), done=session.done,
+                      index=session.index, socket=socket_diagnostics(channel.sock), storage={
+                          "Receiver volume total": human_bytes(disk.total),
+                          "Receiver volume free before transfer": human_bytes(disk.free),
+                      })
+        channel.send({"type": "accept", "destination": str(output.root), "disk_total": disk.total,
+                      "disk_free": disk.free, "index": session.index, "offset": session.offset, "done": session.done})
+
+        reusable = bytearray(BLOCK_SIZE)
+        view = memoryview(reusable)
+        while session.index < count:
+            if session.cancel_event.is_set():
+                raise TransferCancelled(session.cancel_reason)
+            meta = channel.receive()
+            if meta.get("type") != "file":
+                raise ValueError("Expected file metadata.")
+            relative = safe_relative_path(str(meta["path"]))
+            size = int(meta["size"])
+            if size < 0 or int(meta.get("offset", 0)) != session.offset:
+                raise ValueError("Invalid file size or resume position.")
+            current = {"path": relative.as_posix(), "size": size}
+            if session.current and current != session.current:
+                raise ValueError("The resumed file does not match the original transfer.")
+            if session.current is None:
+                session.current = current
+                session.hasher = hashlib.sha256() if verify else None
+            received_file = (output.data_root / relative).resolve()
+            if not received_file.is_relative_to(output.data_root):
+                raise ValueError("File path is outside the transfer destination.")
+            received_file.parent.mkdir(parents=True, exist_ok=True)
+            emit_transfer(self.events, tid, "file_start", index=session.index + 1, file_count=count,
+                          path=relative.as_posix(), destination=str(output.root / relative), size=size)
+            last_progress = 0.0
+            try:
+                with open(received_file, "r+b" if received_file.exists() else "w+b", buffering=0) as target:
+                    target.seek(session.offset)
+                    target.truncate()
+                    while session.offset < size:
+                        if session.cancel_event.is_set():
+                            raise TransferCancelled(session.cancel_reason)
+                        wanted = min(BLOCK_SIZE, size - session.offset)
+                        filled = 0
+                        while filled < wanted:
+                            got = channel.receive_bytes(view[filled:wanted])
+                            filled += got
+                        block = view[:filled]
+                        target.write(block)
+                        if session.hasher:
+                            session.hasher.update(block)
+                        session.offset += filled
+                        session.done += filled
+                        now = time.monotonic()
+                        if now - last_progress >= 0.10:
+                            emit_transfer(self.events, tid, "progress", done=session.done, total=total,
+                                          current_file_done=session.offset, current_file_size=size, current=relative.as_posix())
+                            last_progress = now
+            finally:
+                # Windows finalizes the modification time when the file handle closes.
+                info = received_file.stat()
+                session.saved_files[relative.as_posix()] = (info.st_size, info.st_mtime_ns)
+            digest = ""
+            if verify:
+                trailer = channel.receive()
+                digest = session.hasher.hexdigest()
+                if trailer.get("type") != "hash" or digest != trailer.get("sha256"):
+                    raise RuntimeError(f"SHA-256 verification failed for {relative.as_posix()}")
+            # Save the checkpoint before acknowledging it: a lost ACK skips this file on reconnect.
+            session.index += 1
+            session.offset = 0
+            session.current = None
+            session.hasher = None
+            emit_transfer(self.events, tid, "file_done", index=session.index, path=relative.as_posix(), size=size, sha256=digest)
+            channel.send({"type": "file_ok"})
+
+        if channel.receive().get("type") != "done":
+            raise ValueError("Transfer did not end correctly.")
+        if session.cancel_event.is_set():
+            raise TransferCancelled(session.cancel_reason)
+        if not output.wrap:
+            emit_transfer(self.events, tid, "phase", phase="Saving files",
+                          message="Saving to the chosen destination. Resolve any Windows replace/skip prompts on the receiver.")
+            saving_finished = threading.Event()
+
+            def drain_heartbeats():
+                while not saving_finished.is_set():
+                    try:
+                        if channel.receive().get("type") != "ping":
+                            return
+                    except OSError:
+                        return
+
+            threading.Thread(target=drain_heartbeats, daemon=True, name="save-connection-monitor").start()
+            try:
+                output.save(session.cancel_event, decision.owner)
+            finally:
+                saving_finished.set()
+        if session.cancel_event.is_set():
+            raise TransferCancelled(session.cancel_reason)
+        elapsed = max(time.monotonic() - session.started, 0.001)
+        # Cache completion before sending its ACK, so reconnecting never repeats the Windows save.
+        self._finish(session, {"type": "done_ok"}, "done", done=session.done,
+                     average_bps=session.done / elapsed, destination=str(output.root))
+        channel.send(session.result)
 
 
 class Sender:
@@ -1325,273 +2025,325 @@ class Sender:
         with self.state_lock:
             if transfer_id and transfer_id != self.active_transfer_id:
                 return
+            if self.cancel_event.is_set():
+                return
             self.cancel_event.set()
             sock = self.active_socket
         if sock:
-            try:
-                sock.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
+            close_transfer_socket(sock)
 
-    def send(self, peer_ip: str, peer_name: str, paths: list[Path], verify: bool) -> str | None:
+    def send(self, peer_ip: str, peer_name: str, paths: list[Path], verify: bool, wrap: bool = True) -> str | None:
         if not self.coordinator.acquire(blocking=False):
             return None
         transfer_id = uuid.uuid4().hex
         self.cancel_event.clear()
         with self.state_lock:
             self.active_transfer_id = transfer_id
-        threading.Thread(
-            target=self._send_worker,
-            args=(transfer_id, peer_ip, peer_name, paths, verify),
-            daemon=True,
-            name="sender",
-        ).start()
+        threading.Thread(target=self._send_worker,
+                         args=(transfer_id, peer_ip, peer_name, paths, verify, None, wrap),
+                         daemon=True, name="sender").start()
         return transfer_id
 
-    def _send_worker(
-        self,
-        transfer_id: str,
-        peer_ip: str,
-        peer_name: str,
-        paths: list[Path],
-        verify: bool,
-    ) -> None:
-        sock = None
-        responses: queue.Queue = queue.Queue()
-        remote_cancel_event = threading.Event()
-        remote_cancel_reason = [""]
+    def _connect(self, peer_ip: str) -> TransferChannel:
+        sock = socket.socket(adapter_family(self.adapter), socket.SOCK_STREAM)
+        configure_stream_socket(sock, automatic_buffers=isinstance(self.adapter, WifiAdapter))
+        with self.state_lock:
+            self.active_socket = sock
+        try:
+            sock.bind(adapter_endpoint(self.adapter, 0))
+            sock.settimeout(5)
+            sock.connect(adapter_endpoint(self.adapter, TRANSFER_PORT, peer_ip))
+            return TransferChannel(sock)
+        except Exception:
+            close_transfer_socket(sock)
+            raise
 
-        def read_responses() -> None:
-            while True:
-                try:
-                    response = recv_frame(sock)
-                except Exception as exc:
-                    responses.put(("error", exc))
-                    return
-                if response.get("type") == "cancel":
-                    remote_cancel_reason[0] = str(
-                        response.get("reason") or "The receiver cancelled the transfer."
-                    )
-                    remote_cancel_event.set()
-                    responses.put(("cancel", response))
-                    try:
-                        sock.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass
-                    return
-                responses.put(("response", response))
+    def _notify_stop(self, peer_ip: str, transfer_id: str, reason: str, failed: bool = False) -> None:
+        waiting = False
+        while True:
+            channel = None
+            try:
+                channel = self._connect(peer_ip)
+                channel.send({"magic": MAGIC, "version": PROTOCOL_VERSION, "transfer_id": transfer_id,
+                              "type": "abort" if failed else "cancel", "reason": reason})
+                reply = channel.receive()
+                if reply.get("type") == "error":
+                    raise RuntimeError(str(reply.get("reason") or "Receiver cleanup failed."))
+                return
+            except OSError:
+                if failed:
+                    raise RuntimeError(f"{reason} Receiver unreachable; cancel on that laptop to remove its paused output.")
+                if not waiting:
+                    emit_transfer(self.events, transfer_id, "phase", phase="Cancelling",
+                                  message="Waiting to reconnect so the receiver can remove the new output. Keep both apps open.")
+                    waiting = True
+            finally:
+                if channel:
+                    channel.close()
+            time.sleep(RECONNECT_DELAY)
 
-        def wait_for_response() -> dict:
-            kind, value = responses.get()
-            if kind == "cancel":
-                raise TransferCancelled(remote_cancel_reason[0])
-            if kind == "error":
-                raise value
-            return value
-
+    def _send_worker(self, transfer_id: str, peer_ip: str, peer_name: str, paths: list[Path],
+                     verify: bool, prepared: tuple | None = None, wrap: bool = True) -> None:
+        channel = None
+        offered = False
+        started = 0.0
         try:
             emit_transfer(self.events, transfer_id, "phase", phase="Scanning selected files", message="Reading names and sizes.")
-            items, total = build_transfer_items(paths, self.cancel_event)
+            items, total = prepared if prepared is not None else build_transfer_items(paths, self.cancel_event)
             if self.cancel_event.is_set():
                 raise TransferCancelled("Transfer cancelled while scanning files.")
             if not items:
                 raise RuntimeError("No transferable files were selected.")
-
             roots = sorted({PurePosixPath(item.relative).parts[0] for item in items}, key=str.casefold)
-            emit_transfer(
-                self.events,
-                transfer_id,
-                "prepared",
-                peer=peer_name,
-                peer_ip=peer_ip,
-                total=total,
-                file_count=len(items),
-                verify=verify,
-                roots=roots,
-            )
-
-            sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-            configure_stream_socket(sock)
-            with self.state_lock:
-                self.active_socket = sock
-
-            emit_transfer(self.events, transfer_id, "phase", phase="Connecting", message=f"Opening a direct TCP connection to {peer_name}.")
-            sock.bind(ipv6_scope_tuple(self.adapter.link_local, 0, self.adapter.if_index))
-            sock.settimeout(10)
-            sock.connect(ipv6_scope_tuple(peer_ip, TRANSFER_PORT, self.adapter.if_index))
-            sock.settimeout(None)
-            if self.cancel_event.is_set():
-                raise TransferCancelled("Transfer cancelled while connecting.")
-            emit_transfer(self.events, transfer_id, "connected", socket=socket_diagnostics(sock))
-            threading.Thread(
-                target=read_responses,
-                daemon=True,
-                name="sender-response-monitor",
-            ).start()
-
-            send_frame(
-                sock,
-                {
-                    "magic": MAGIC,
-                    "type": "offer",
-                    "version": PROTOCOL_VERSION,
-                    "transfer_id": transfer_id,
-                    "hostname": socket.gethostname(),
-                    "total_bytes": total,
-                    "file_count": len(items),
-                    "verify": verify,
-                    "roots": roots,
-                },
-            )
-            emit_transfer(
-                self.events,
-                transfer_id,
-                "phase",
-                phase="Waiting for receiver",
-                message="The receiver must choose a destination folder and accept.",
-            )
-            reply = wait_for_response()
-            if reply.get("type") == "cancel":
-                raise TransferCancelled(str(reply.get("reason") or "The receiver cancelled the transfer."))
-            if reply.get("type") == "reject":
-                raise TransferRejected(str(reply.get("reason") or "The receiver declined the transfer."))
-            if reply.get("type") != "accept":
-                raise RuntimeError("The receiver returned an invalid response.")
-
-            remote_destination = str(reply.get("destination") or "Chosen on receiver")
-            disk_total = int(reply.get("disk_total") or 0)
-            disk_free = int(reply.get("disk_free") or 0)
-            storage = {
-                "Receiver volume total": f"{human_bytes(disk_total)} ({disk_total} bytes)" if disk_total else "Unavailable",
-                "Receiver volume free before transfer": (
-                    f"{human_bytes(disk_free)} ({disk_free} bytes)" if disk_free else "Unavailable"
-                ),
-                "Receiver free space after payload (estimated)": (
-                    f"{human_bytes(disk_free - total)} ({disk_free - total} bytes)" if disk_free else "Unavailable"
-                ),
-            }
-            emit_transfer(
-                self.events,
-                transfer_id,
-                "start",
-                direction="Sending",
-                peer=peer_name,
-                peer_ip=peer_ip,
-                total=total,
-                file_count=len(items),
-                verify=verify,
-                destination=remote_destination,
-                socket=socket_diagnostics(sock),
-                storage=storage,
-            )
-
-            sent_total = 0
-            started = time.monotonic()
-            reusable = bytearray(BLOCK_SIZE)
-            view = memoryview(reusable)
-
-            for file_index, item in enumerate(items, 1):
+            manifest = hashlib.sha256(json.dumps([(i.relative, i.size, i.modified_ns) for i in items]).encode()).hexdigest()
+            offer = {"magic": MAGIC, "type": "offer", "version": PROTOCOL_VERSION,
+                     "transfer_id": transfer_id, "hostname": socket.gethostname(), "manifest": manifest,
+                     "total_bytes": total, "file_count": len(items), "verify": verify, "wrap": wrap, "roots": roots}
+            emit_transfer(self.events, transfer_id, "prepared", peer=peer_name, peer_ip=peer_ip,
+                          total=total, file_count=len(items), verify=verify, wrap=wrap, roots=roots)
+            emit_transfer(self.events, transfer_id, "phase", phase="Connecting", message=f"Connecting to {peer_name}.")
+            retrying = False
+            while True:
                 if self.cancel_event.is_set():
                     raise TransferCancelled("Transfer cancelled by the sender.")
+                try:
+                    try:
+                        channel = self._connect(peer_ip)
+                    except OSError as exc:
+                        raise TransferInterrupted(str(exc)) from exc
+                    # Until acceptance, retry the same offer. An unreceived first offer is safe to repeat.
+                    channel.send({**offer, "resume": bool(started)})
+                    offered = True
+                    responses = queue.Queue()
+                    connection = channel
 
-                send_frame(sock, {"type": "file", "path": item.relative, "size": item.size})
-                emit_transfer(
-                    self.events,
-                    transfer_id,
-                    "file_start",
-                    index=file_index,
-                    file_count=len(items),
-                    path=item.relative,
-                    source=str(item.source),
-                    size=item.size,
-                )
-                hasher = hashlib.sha256() if verify else None
-                file_done = 0
-                last_progress = 0.0
+                    def read_responses(connection=connection, responses=responses):
+                        try:
+                            while True:
+                                response = connection.receive()
+                                responses.put(response)
+                                if response.get("type") in ("cancel", "error", "reject", "done_ok"):
+                                    if response.get("type") != "done_ok":
+                                        connection.close()
+                                    return
+                        except Exception as exc:
+                            responses.put(exc)
+                            connection.close()
 
-                with open(item.source, "rb", buffering=0) as f:
-                    while True:
-                        if self.cancel_event.is_set():
-                            raise TransferCancelled("Transfer cancelled by the sender.")
+                    threading.Thread(target=read_responses, daemon=True, name="sender-response-monitor").start()
 
-                        n = f.readinto(reusable)
-                        if not n:
-                            break
+                    def response():
+                        value = responses.get()
+                        if isinstance(value, Exception):
+                            raise value
+                        kind = value.get("type")
+                        if kind == "cancel":
+                            raise TransferCancelled(str(value.get("reason") or "The receiver cancelled the transfer."))
+                        if kind == "reject":
+                            raise TransferRejected(str(value.get("reason") or "The receiver declined the transfer."))
+                        if kind == "error":
+                            raise RuntimeError(str(value.get("reason") or "The receiver could not save the transfer."))
+                        return value
 
-                        block = view[:n]
-                        if hasher:
-                            hasher.update(block)
-                        sock.sendall(block)
-                        file_done += n
-                        sent_total += n
-
-                        now = time.monotonic()
-                        if now - last_progress >= 0.10:
-                            emit_transfer(
-                                self.events,
-                                transfer_id,
-                                "progress",
-                                done=sent_total,
-                                total=total,
-                                current_file_done=file_done,
-                                current_file_size=item.size,
-                                current=item.relative,
-                            )
-                            last_progress = now
-
-                digest = hasher.hexdigest() if hasher else ""
-                if verify:
-                    send_frame(sock, {"type": "hash", "sha256": digest})
-
-                ack = wait_for_response()
-                if ack.get("type") == "cancel":
-                    raise TransferCancelled(str(ack.get("reason") or "The receiver cancelled the transfer."))
-                if ack.get("type") != "file_ok":
-                    raise RuntimeError(f"Receiver did not confirm {item.relative}")
-                emit_transfer(
-                    self.events,
-                    transfer_id,
-                    "file_done",
-                    index=file_index,
-                    path=item.relative,
-                    size=item.size,
-                    sha256=digest,
-                )
-
-            send_frame(sock, {"type": "done"})
-            final = wait_for_response()
-            if final.get("type") == "cancel":
-                raise TransferCancelled(str(final.get("reason") or "The receiver cancelled the transfer."))
-            if final.get("type") != "done_ok":
-                raise RuntimeError("Receiver did not confirm transfer completion.")
-
-            elapsed = max(time.monotonic() - started, 0.001)
-            emit_transfer(self.events, transfer_id, "done", done=sent_total, average_bps=sent_total / elapsed)
-
+                    if not started:
+                        emit_transfer(self.events, transfer_id, "phase", phase="Waiting for receiver",
+                                      message="The receiver must choose a destination folder and accept.")
+                    reply = response()
+                    if reply.get("type") == "done_ok":
+                        break
+                    if reply.get("type") != "accept":
+                        raise RuntimeError("The receiver returned an invalid response.")
+                    index, offset = int(reply["index"]), int(reply["offset"])
+                    sent_total = int(reply["done"])
+                    if not 0 <= index <= len(items) or (index < len(items) and not 0 <= offset <= items[index].size):
+                        raise ValueError("The receiver returned an invalid resume position.")
+                    if retrying:
+                        for item in items:
+                            info = item.source.stat()
+                            if (info.st_size, info.st_mtime_ns) != (item.size, item.modified_ns):
+                                raise RuntimeError(f"Source file changed during interruption: {item.relative}. Send the transfer again.")
+                    emit_transfer(self.events, transfer_id, "resumed" if started else "start", direction="Sending",
+                                  peer=peer_name, peer_ip=peer_ip, total=total, file_count=len(items), verify=verify,
+                                  destination=reply["destination"], done=sent_total, index=index,
+                                  socket=socket_diagnostics(channel.sock), storage={
+                                      "Receiver volume total": human_bytes(reply["disk_total"]),
+                                      "Receiver volume free before transfer": human_bytes(reply["disk_free"]),
+                                  })
+                    if not started:
+                        started = time.monotonic()
+                    retrying = False
+                    reusable = bytearray(BLOCK_SIZE)
+                    view = memoryview(reusable)
+                    for file_index in range(index, len(items)):
+                        item = items[file_index]
+                        info = item.source.stat()
+                        if (info.st_size, info.st_mtime_ns) != (item.size, item.modified_ns):
+                            raise RuntimeError(f"Source file changed: {item.relative}. Send the transfer again.")
+                        emit_transfer(self.events, transfer_id, "file_start", index=file_index + 1,
+                                      file_count=len(items), path=item.relative, source=str(item.source), size=item.size)
+                        hasher = hashlib.sha256() if verify else None
+                        with open(item.source, "rb", buffering=0) as source:
+                            if offset and hasher:
+                                emit_transfer(self.events, transfer_id, "phase", phase="Preparing to resume",
+                                              message="Checking the saved portion of the current file.")
+                                remaining = offset
+                                while remaining:
+                                    if self.cancel_event.is_set():
+                                        raise TransferCancelled("Transfer cancelled by the sender.")
+                                    n = source.readinto(view[:min(BLOCK_SIZE, remaining)])
+                                    if not n:
+                                        raise RuntimeError(f"Source file changed: {item.relative}")
+                                    hasher.update(view[:n])
+                                    remaining -= n
+                                emit_transfer(self.events, transfer_id, "phase", phase="Transferring",
+                                              message="Continuing from saved progress.")
+                            else:
+                                source.seek(offset)
+                            with channel.send_lock:
+                                channel.send_file_frame({"type": "file", "path": item.relative, "size": item.size, "offset": offset})
+                                file_done, last_progress = offset, 0.0
+                                while file_done < item.size:
+                                    if self.cancel_event.is_set():
+                                        raise TransferCancelled("Transfer cancelled by the sender.")
+                                    n = source.readinto(view[:min(BLOCK_SIZE, item.size - file_done)])
+                                    if not n:
+                                        raise RuntimeError(f"Source file changed: {item.relative}")
+                                    block = view[:n]
+                                    if hasher:
+                                        hasher.update(block)
+                                    channel.send_bytes(block)
+                                    file_done += n
+                                    sent_total += n
+                                    now = time.monotonic()
+                                    if now - last_progress >= 0.10:
+                                        emit_transfer(self.events, transfer_id, "progress", done=sent_total, total=total,
+                                                      current_file_done=file_done, current_file_size=item.size, current=item.relative)
+                                        last_progress = now
+                                digest = hasher.hexdigest() if hasher else ""
+                                if verify:
+                                    channel.send_file_frame({"type": "hash", "sha256": digest})
+                        info = item.source.stat()
+                        if (info.st_size, info.st_mtime_ns) != (item.size, item.modified_ns):
+                            raise RuntimeError(f"Source file changed: {item.relative}. Send the transfer again.")
+                        if response().get("type") != "file_ok":
+                            raise RuntimeError(f"Receiver did not confirm {item.relative}")
+                        emit_transfer(self.events, transfer_id, "file_done", index=file_index + 1,
+                                      path=item.relative, size=item.size, sha256=digest)
+                        offset = 0
+                    channel.send({"type": "done"})
+                    if not wrap:
+                        emit_transfer(self.events, transfer_id, "phase", phase="Waiting for receiver",
+                                      message="The receiver is saving files. Resolve any Windows replace/skip prompts on that laptop.")
+                    if response().get("type") != "done_ok":
+                        raise RuntimeError("Receiver did not confirm transfer completion.")
+                    break
+                except TransferInterrupted:
+                    if self.cancel_event.is_set():
+                        raise TransferCancelled("Transfer cancelled by the sender.")
+                    if not retrying:
+                        emit_transfer(self.events, transfer_id, "paused", total=total,
+                                      message="Connection interrupted. Waiting to reconnect — keep both apps open.")
+                    retrying = True
+                finally:
+                    if channel:
+                        channel.close()
+                        channel = None
+                self.cancel_event.wait(RECONNECT_DELAY)
+            elapsed = max(time.monotonic() - (started or time.monotonic()), 0.001)
+            emit_transfer(self.events, transfer_id, "done", done=total, average_bps=total / elapsed)
         except TransferRejected as exc:
             emit_transfer(self.events, transfer_id, "rejected", message=str(exc))
         except TransferCancelled as exc:
+            if offered and self.cancel_event.is_set():
+                try:
+                    self._notify_stop(peer_ip, transfer_id, str(exc))
+                except Exception as cleanup_error:
+                    emit_transfer(self.events, transfer_id, "failed", message=str(cleanup_error))
+                    return
             emit_transfer(self.events, transfer_id, "cancelled", message=str(exc))
         except Exception as exc:
-            remote_cancel = remote_cancel_reason[0] if remote_cancel_event.is_set() else ""
-            action = "cancelled" if self.cancel_event.is_set() or remote_cancel else "failed"
-            emit_transfer(
-                self.events,
-                transfer_id,
-                action,
-                message=remote_cancel or str(exc),
-                error_type=type(exc).__name__,
-            )
+            message = str(exc)
+            if offered:
+                try:
+                    self._notify_stop(peer_ip, transfer_id, message, failed=True)
+                except Exception as cleanup_error:
+                    message = str(cleanup_error)
+            emit_transfer(self.events, transfer_id, "failed", message=message, error_type=type(exc).__name__)
         finally:
+            if channel:
+                channel.close()
             with self.state_lock:
                 self.active_socket = None
                 self.active_transfer_id = None
-            if sock:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
             self.coordinator.release()
+            emit_transfer(self.events, transfer_id, "worker_stopped")
+
+
+class SenderGroup:
+    def __init__(self, adapter, events, coordinator):
+        self.adapter, self.events, self.coordinator = adapter, events, coordinator
+        self.cancel_event = threading.Event()
+        self.lock = threading.Lock()
+        self.workers = {}
+        self.cancelled = set()
+        self.remaining = set()
+
+    def send(self, peers, paths, verify, wrap=True):
+        if not self.coordinator.acquire(blocking=False):
+            return None
+        recipients = {uuid.uuid4().hex: peer for peer in peers}
+        with self.lock:
+            self.cancel_event.clear()
+            self.cancelled.clear()
+            self.remaining = set(recipients)
+            self.workers = {tid: Sender(self.adapter, self.events, threading.Lock()) for tid in recipients}
+        threading.Thread(target=self._prepare, args=(recipients, list(paths), verify, wrap), daemon=True).start()
+        return recipients
+
+    def _prepare(self, recipients, paths, verify, wrap):
+        try:
+            prepared = build_transfer_items(paths, self.cancel_event)
+            if not prepared[0]:
+                raise RuntimeError("No transferable files were selected.")
+        except Exception as exc:
+            for tid in recipients:
+                emit_transfer(self.events, tid, "cancelled" if self.cancel_event.is_set() else "failed", message=str(exc))
+                emit_transfer(self.events, tid, "worker_stopped")
+            return
+        for tid, peer in recipients.items():
+            with self.lock:
+                worker = self.workers[tid]
+                cancelled = tid in self.cancelled or self.cancel_event.is_set()
+                if not cancelled:
+                    worker.coordinator.acquire()
+                    worker.active_transfer_id = tid
+            if cancelled:
+                emit_transfer(self.events, tid, "cancelled", message="Transfer cancelled before connecting.")
+                emit_transfer(self.events, tid, "worker_stopped")
+            else:
+                threading.Thread(target=worker._send_worker,
+                    args=(tid, peer["ip"], peer["name"], paths, verify, prepared, wrap), daemon=True).start()
+
+    def cancel(self, transfer_id=None):
+        with self.lock:
+            ids = [transfer_id] if transfer_id else list(self.workers)
+            if transfer_id is None:
+                self.cancel_event.set()
+            for tid in ids:
+                self.cancelled.add(tid)
+                worker = self.workers.get(tid)
+                if worker:
+                    worker.cancel()
+
+    def worker_stopped(self, transfer_id):
+        with self.lock:
+            if transfer_id not in self.remaining:
+                return False
+            self.remaining.remove(transfer_id)
+            if self.remaining:
+                return False
+            self.coordinator.release()
+            return True
 
 
 def human_bytes(value: float) -> str:
@@ -1632,7 +2384,7 @@ def set_system_awake(required: bool) -> tuple[bool, str]:
     return True, "Released"
 
 
-class TransferDialog(tk.Toplevel):
+class TransferView(tk.Frame):
     def __init__(
         self,
         parent: tk.Tk,
@@ -1647,13 +2399,13 @@ class TransferDialog(tk.Toplevel):
         sources: list[Path] | None = None,
     ):
         super().__init__(parent)
+        self.adapter_for_badge = adapter
         self.parent = parent
         self.transfer_id = transfer_id
         self.cancel_callback = cancel_callback
         self.close_callback = close_callback
         self.finished = False
         self.cancel_requested = False
-        self.minimized = False
         self.created_monotonic = time.monotonic()
         self.transfer_started_monotonic: float | None = None
         self.last_progress_monotonic: float | None = None
@@ -1666,21 +2418,21 @@ class TransferDialog(tk.Toplevel):
         self.log_entries: list[str] = []
         self.accept_button: ttk.Button | None = None
 
-        self.title(f"{APP_NAME} — {direction} diagnostics")
-        self.monitor_dpi, self.ui_scale = configure_tk_dpi(self)
-        set_scaled_window_geometry(self, 980, 740, 820, 620, self.ui_scale)
+        self.monitor_dpi, self.ui_scale = parent.monitor_dpi, parent.ui_scale
         self.configure(background=COLOR_BG)
-        self.transient(parent)
-        self.protocol("WM_DELETE_WINDOW", self._cancel_or_close)
 
         self.phase_var = tk.StringVar(value="Preparing")
-        self.message_var = tk.StringVar(value="Starting transfer diagnostics…")
+        self.message_var = tk.StringVar(value="Preparing your transfer…")
         self.percent_var = tk.StringVar(value="0.0%")
         self.transferred_var = tk.StringVar(value="0 B")
         self.rate_var = tk.StringVar(value="Waiting")
         self.eta_var = tk.StringVar(value="Unknown")
         self.elapsed_var = tk.StringVar(value="0s")
 
+        self.peer_display_var = tk.StringVar(value=peer)
+        self.contents_var = tk.StringVar(value="Preparing files…")
+        self.current_file_var = tk.StringVar(value="")
+        self.destination_var = tk.StringVar(value="")
         self._build_ui(direction)
         self.set_details(
             {
@@ -1690,7 +2442,7 @@ class TransferDialog(tk.Toplevel):
                 "Phase": "Preparing",
                 "Protocol": f"{MAGIC} / version {PROTOCOL_VERSION}",
                 "App session ID": SESSION_ID,
-                "Dialog opened": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "Transfer view opened": datetime.now().astimezone().isoformat(timespec="seconds"),
                 "Process ID": str(os.getpid()),
                 "Executable": sys.executable,
                 "Application path": str(Path(__file__).resolve()),
@@ -1703,20 +2455,20 @@ class TransferDialog(tk.Toplevel):
                 "Worker model": "Background network/file thread with Tk UI event queue",
                 "Local computer": socket.gethostname(),
                 "Peer computer": peer,
-                "Peer IPv6": peer_ip,
-                "Transport": "TCP over IPv6 link-local / direct physical Ethernet",
+                "Peer address": peer_ip,
+                "Transport": "TCP over local Wi-Fi / IPv4" if isinstance(adapter, WifiAdapter) else "TCP over IPv6 link-local / direct physical Ethernet",
                 "Adapter": adapter.name,
                 "Interface index": str(adapter.if_index),
-                "Local IPv6": f"{adapter.link_local}%{adapter.if_index}",
+                "Local address": adapter.address if isinstance(adapter, WifiAdapter) else f"{adapter.link_local}%{adapter.if_index}",
                 "Adapter MAC": adapter.mac or "Unavailable",
                 "Negotiated link speed": adapter.link_speed or "Unavailable",
                 "Receive link capacity": f"{human_bytes(adapter.rx_bps / 8)}/s ({adapter.rx_bps} bit/s)",
                 "Transmit link capacity": f"{human_bytes(adapter.tx_bps / 8)}/s ({adapter.tx_bps} bit/s)",
                 "Default gateway": "Present" if adapter.has_gateway else "None (direct-link requirement met)",
-                "Discovery endpoint": f"[{DISCOVERY_GROUP}%{adapter.if_index}]:{DISCOVERY_PORT}/UDP",
+                "Discovery endpoint": f"{adapter.network.broadcast_address}:{DISCOVERY_PORT}/UDP" if isinstance(adapter, WifiAdapter) else f"[{DISCOVERY_GROUP}%{adapter.if_index}]:{DISCOVERY_PORT}/UDP",
                 "Transfer port": f"{TRANSFER_PORT}/TCP",
                 "Application block size": f"{human_bytes(BLOCK_SIZE)} ({BLOCK_SIZE} bytes)",
-                "Requested socket buffer": f"{human_bytes(SOCKET_BUFFER)} ({SOCKET_BUFFER} bytes)",
+                "Requested socket buffer": "Automatic (managed by Windows)" if isinstance(adapter, WifiAdapter) else f"{human_bytes(SOCKET_BUFFER)} ({SOCKET_BUFFER} bytes)",
                 "Integrity verification": "SHA-256 enabled" if verify else "Disabled",
                 "Selected source paths": " | ".join(str(path) for path in (sources or [])) or "Supplied by sender",
                 "Power behavior": "Automatic system sleep blocked; display sleep is allowed",
@@ -1725,130 +2477,98 @@ class TransferDialog(tk.Toplevel):
                 "Cancellation behavior": "Immediately closes the active transfer socket",
             }
         )
-        self.add_log(f"Diagnostics opened for {direction.lower()} transfer {transfer_id}.")
-        self.after(250, self._tick)
-        self.after_idle(self._activate_modal)
+        self.add_log(f"Transfer view opened for {direction.lower()} transfer {transfer_id}.")
+        self.winfo_toplevel().after(250, self._tick)
 
     def _build_ui(self, direction: str) -> None:
-        outer = ttk.Frame(self, style="App.TFrame", padding=22)
+        outer = ttk.Frame(self, style="App.TFrame", padding=(32, 22))
         outer.pack(fill="both", expand=True)
-
         heading = ttk.Frame(outer, style="App.TFrame")
-        heading.pack(fill="x")
-        mark_color = COLOR_ACCENT if direction == "Sending" else COLOR_CYAN
-        mark = tk.Label(
-            heading,
-            text="↑" if direction == "Sending" else "↓",
-            bg=mark_color,
-            fg="#FFFFFF" if direction == "Sending" else COLOR_BG,
-            font=("Segoe UI", 18, "bold"),
-            width=2,
-            height=1,
-        )
-        mark.pack(side="left", padx=(0, 12))
-        title_stack = ttk.Frame(heading, style="App.TFrame")
-        title_stack.pack(side="left")
-        ttk.Label(title_stack, text=direction, style="Title.TLabel").pack(anchor="w")
-        ttk.Label(title_stack, text=f"Transfer {self.transfer_id[:8]}", style="Subtitle.TLabel").pack(anchor="w")
-        self.phase_label = ttk.Label(heading, textvariable=self.phase_var, style="Phase.TLabel")
-        self.phase_label.pack(side="right")
-        ttk.Label(outer, textvariable=self.message_var, style="Subtitle.TLabel", wraplength=900).pack(
-            anchor="w", pady=(12, 12)
-        )
+        heading.pack(fill="x", pady=(0, 16))
+        ttk.Label(heading, text="Send files" if direction == "Sending" else "Receive files", style="Title.TLabel").pack(side="left")
+        mode_badge(heading, "wifi" if isinstance(self.adapter_for_badge, WifiAdapter) else "ethernet").pack(side="right")
+        navigation = ttk.Frame(outer, style="App.TFrame")
+        navigation.pack(fill="x", pady=(0, 18))
+        self.overview_button = ttk.Button(navigation, text="Overview", command=lambda: self._show_transfer_page(False), style="SelectedSegment.TButton")
+        self.overview_button.pack(side="left")
+        self.details_button = ttk.Button(navigation, text="Details", command=lambda: self._show_transfer_page(True), style="Segment.TButton")
+        self.details_button.pack(side="left", padx=(4, 0))
+        self.page_container = ttk.Frame(outer, style="App.TFrame")
+        self.page_container.pack(fill="both", expand=True)
+        self.overview = ttk.Frame(self.page_container, style="App.TFrame")
+        self.overview.pack(fill="both", expand=True)
+        self.phase_label = ttk.Label(self.overview, textvariable=self.phase_var, style="Phase.TLabel")
+        self.phase_label.pack(anchor="w", pady=(6, 8))
+        ttk.Label(self.overview, textvariable=self.peer_display_var, style="Hero.TLabel").pack(anchor="w")
+        ttk.Label(self.overview, textvariable=self.contents_var, style="Subtitle.TLabel", wraplength=750).pack(anchor="w", pady=(8, 0))
+        ttk.Label(self.overview, textvariable=self.message_var, style="Subtitle.TLabel", wraplength=750).pack(anchor="w", pady=(14, 20))
+        self.progress_area = ttk.Frame(self.overview, style="App.TFrame")
+        self.progress = ttk.Progressbar(self.progress_area, maximum=100, style="Modern.Horizontal.TProgressbar")
+        self.progress.pack(fill="x", pady=(4, 8))
+        progress_line = ttk.Frame(self.progress_area, style="App.TFrame")
+        progress_line.pack(fill="x")
+        ttk.Label(progress_line, textvariable=self.transferred_var, style="Subtitle.TLabel").pack(side="left")
+        ttk.Label(progress_line, textvariable=self.percent_var, style="Subtitle.TLabel").pack(side="right")
+        metrics = RoundedCard(self.overview, height=95)
+        self.metrics_card = metrics
+        for column, (label, variable) in enumerate((("Speed", self.rate_var), ("Time remaining", self.eta_var), ("Elapsed", self.elapsed_var))):
+            box = ttk.Frame(metrics.body, style="Card.TFrame")
+            box.grid(row=0, column=column, sticky="w")
+            ttk.Label(box, text=label, style="MetricLabel.TLabel").pack(anchor="w")
+            ttk.Label(box, textvariable=variable, style="MetricValue.TLabel").pack(anchor="w", pady=(4, 0))
+            metrics.body.columnconfigure(column, weight=1)
 
-        self.progress = ttk.Progressbar(outer, maximum=100, style="Modern.Horizontal.TProgressbar")
-        self.progress.pack(fill="x")
-        ttk.Label(outer, textvariable=self.percent_var, style="AccentText.TLabel").pack(anchor="e", pady=(4, 10))
-
-        metrics = ttk.Frame(outer, style="App.TFrame")
-        metrics.pack(fill="x", pady=(0, 12))
-        for column, (label, variable) in enumerate(
-            (
-                ("Transferred", self.transferred_var),
-                ("Current speed", self.rate_var),
-                ("ETA", self.eta_var),
-                ("Elapsed", self.elapsed_var),
-            )
-        ):
-            box = ttk.Frame(metrics, style="Card.TFrame", padding=(13, 9))
-            box.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 0))
-            ttk.Label(box, text=label.upper(), style="MetricLabel.TLabel").pack(anchor="w")
-            ttk.Label(box, textvariable=variable, style="MetricValue.TLabel").pack(anchor="w", pady=(3, 0))
-            metrics.columnconfigure(column, weight=1)
-
-        notebook = ttk.Notebook(outer)
-        notebook.pack(fill="both", expand=True)
-
-        details_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=7)
-        log_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=7)
-        notebook.add(details_tab, text="  All diagnostics  ")
-        notebook.add(log_tab, text="  Activity log  ")
-
-        self.detail_tree = ttk.Treeview(
-            details_tab,
-            columns=("value",),
-            show="tree headings",
-            selectmode="browse",
-            height=8,
-        )
+        self.diagnostics = ttk.Frame(self.page_container, style="App.TFrame")
+        diagnostic_nav = ttk.Frame(self.diagnostics, style="App.TFrame")
+        diagnostic_nav.pack(fill="x", pady=(0, 12))
+        self.fields_button = ttk.Button(diagnostic_nav, text="All diagnostics", style="Selected.Ghost.TButton", command=lambda: self._show_diagnostic_log(False))
+        self.fields_button.pack(side="left")
+        self.log_button = ttk.Button(diagnostic_nav, text="Activity log", style="Ghost.TButton", command=lambda: self._show_diagnostic_log(True))
+        self.log_button.pack(side="left", padx=(8, 0))
+        ttk.Button(diagnostic_nav, text="Copy diagnostics", command=self.copy_diagnostics, style="Ghost.TButton").pack(side="right")
+        details_tab = ttk.Frame(self.diagnostics, style="Card.TFrame", padding=8)
+        log_tab = ttk.Frame(self.diagnostics, style="Card.TFrame", padding=8)
+        self.fields_page, self.log_page = details_tab, log_tab
+        details_tab.pack(fill="both", expand=True)
+        self.detail_tree = ttk.Treeview(details_tab, columns=("value",), show="tree headings", selectmode="browse", height=8)
         self.detail_tree.heading("#0", text="Field")
         self.detail_tree.heading("value", text="Value")
-        self.detail_tree.column("#0", width=220, minwidth=150, stretch=False)
-        self.detail_tree.column("value", width=620, minwidth=250, stretch=True)
-        detail_scroll = ttk.Scrollbar(details_tab, orient="vertical", command=self.detail_tree.yview)
-        self.detail_tree.configure(yscrollcommand=detail_scroll.set)
-        self.detail_tree.pack(side="left", fill="both", expand=True)
-        detail_scroll.pack(side="right", fill="y")
-
-        self.log_text = tk.Text(
-            log_tab,
-            wrap="word",
-            state="disabled",
-            height=8,
-            font=("Cascadia Mono", 9),
-            bg=COLOR_PANEL,
-            fg=COLOR_TEXT,
-            insertbackground=COLOR_TEXT,
-            selectbackground=COLOR_ACCENT,
-            selectforeground="#FFFFFF",
-            relief="flat",
-            borderwidth=0,
-            padx=10,
-            pady=10,
-        )
+        self.detail_tree.column("#0", width=230, minwidth=160, stretch=False)
+        self.detail_tree.column("value", width=500, minwidth=200, stretch=True)
+        scroll = ttk.Scrollbar(details_tab, orient="vertical", command=self.detail_tree.yview)
+        horizontal = ttk.Scrollbar(details_tab, orient="horizontal", command=self.detail_tree.xview)
+        self.detail_tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        horizontal.pack(side="bottom", fill="x")
+        scroll.pack(side="right", fill="y")
+        self.detail_tree.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_tab, wrap="word", state="disabled", height=8, font=("Consolas", 10),
+            bg=COLOR_SURFACE, fg=COLOR_TEXT, selectbackground=COLOR_SURFACE_ALT,
+            relief="flat", borderwidth=0, padx=12, pady=12)
         log_scroll = ttk.Scrollbar(log_tab, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
-
-        power_note = ttk.Frame(outer, style="Card.TFrame", padding=(12, 8))
-        power_note.pack(fill="x", pady=(12, 8))
-        ttk.Label(power_note, text="◐", style="CardTitle.TLabel").pack(side="left", padx=(0, 9))
-        ttk.Label(
-            power_note,
-            text="Keep-awake is active. The screen may turn off; manually forcing sleep still pauses networking.",
-            style="CardMuted.TLabel",
-            wraplength=820,
-        ).pack(side="left", fill="x", expand=True)
-
+        self.log_text.pack(fill="both", expand=True)
         self.actions = ttk.Frame(outer, style="App.TFrame")
-        self.actions.pack(fill="x")
-        ttk.Button(
-            self.actions,
-            text="Copy diagnostics",
-            command=self.copy_diagnostics,
-            style="Ghost.TButton",
-        ).pack(side="left")
-        ttk.Button(self.actions, text="Minimize", command=self._minimize, style="Ghost.TButton").pack(
-            side="left", padx=(8, 0)
-        )
-        self.action_button = ttk.Button(
-            self.actions,
-            text="Cancel transfer",
-            command=self._cancel_or_close,
-            style="Danger.TButton",
-        )
+        self.actions.pack(fill="x", pady=(18, 0))
+        self.action_button = ttk.Button(self.actions, text="Cancel transfer", command=self._cancel_or_close, style="Danger.TButton")
         self.action_button.pack(side="right")
+
+    def _show_transfer_page(self, details):
+        show_view(self.diagnostics if details else self.overview,
+                  self.overview if details else self.diagnostics)
+        self.overview_button.configure(style="Segment.TButton" if details else "SelectedSegment.TButton")
+        self.details_button.configure(style="SelectedSegment.TButton" if details else "Segment.TButton")
+
+    def _show_diagnostic_log(self, log):
+        show_view(self.log_page if log else self.fields_page,
+                  self.fields_page if log else self.log_page)
+        self.fields_button.configure(style="Ghost.TButton" if log else "Selected.Ghost.TButton")
+        self.log_button.configure(style="Selected.Ghost.TButton" if log else "Ghost.TButton")
+
+    def _show_progress(self):
+        if not self.progress_area.winfo_manager():
+            self.progress_area.pack(fill="x")
+            self.metrics_card.pack(fill="x", pady=(22, 16))
 
     def offer_destination_choice(self, callback) -> None:
         if self.accept_button:
@@ -1860,6 +2580,7 @@ class TransferDialog(tk.Toplevel):
             self.accept_button.config(state="disabled")
             callback()
 
+        self.action_button.configure(text="Decline")
         self.accept_button = ttk.Button(
             self.actions,
             text="Choose destination & accept",
@@ -1868,17 +2589,22 @@ class TransferDialog(tk.Toplevel):
         )
         self.accept_button.pack(side="right", padx=(0, 8))
 
-    def _activate_modal(self) -> None:
-        if not self.winfo_exists():
-            return
-        self.deiconify()
-        self.lift()
-        self.focus_force()
-        self.grab_set()
-
     def set_detail(self, name: str, value) -> None:
         text_value = str(value)
         self.details[name] = text_value
+        if name == "Peer computer":
+            self.peer_display_var.set(text_value)
+        elif name in ("Top-level items", "File count", "Total bytes"):
+            items = self.details.get("Top-level items", "")
+            count = self.details.get("File count", "?")
+            size = self.details.get("Total bytes", "").split(" (")[0]
+            self.contents_var.set(f"{count} files · {size}" + (f"\n{items}" if items else ""))
+        elif name == "Current relative path":
+            self.current_file_var.set(text_value)
+        elif name in ("Receiver destination", "Chosen destination parent", "Partial data location"):
+            if text_value != "Unknown":
+                label = "Partial files" if name == "Partial data location" else "Save to"
+                self.destination_var.set(f"{label}: {text_value}")
         item = self.detail_items.get(name)
         if item:
             self.detail_tree.item(item, values=(text_value,))
@@ -1918,11 +2644,28 @@ class TransferDialog(tk.Toplevel):
         if action == "phase":
             self.set_phase(str(data.get("phase") or "Working"), str(data.get("message") or ""))
 
+        elif action == "paused":
+            self.instant_bps = 0.0
+            self.last_progress_monotonic = None
+            self.rate_var.set("Waiting")
+            self.eta_var.set("Waiting")
+            self.set_detail("State", "Waiting to reconnect")
+            self.set_phase("Connection interrupted", str(data.get("message") or "Waiting to reconnect — keep both apps open."))
+
+        elif action == "resumed":
+            self.instant_bps = 0.0
+            self.last_progress_monotonic = None
+            self.set_details(data.get("socket", {}))
+            self.set_detail("Files completed", data.get("index", 0))
+            self.set_detail("State", "Transferring")
+            self._apply_progress(data)
+            self.set_phase("Transferring", "Connection restored. Continuing from saved progress.")
+
         elif action == "prepared":
             self.set_details(
                 {
                     "Peer computer": data.get("peer", "Unknown"),
-                    "Peer IPv6": data.get("peer_ip", "Unknown"),
+                    "Peer address": data.get("peer_ip", "Unknown"),
                     "Top-level items": " | ".join(data.get("roots", [])) or "None",
                     "File count": data.get("file_count", 0),
                     "Total bytes": f"{human_bytes(data.get('total', 0))} ({data.get('total', 0)} bytes)",
@@ -1937,13 +2680,17 @@ class TransferDialog(tk.Toplevel):
             self.add_log("Direct TCP connection established.")
 
         elif action == "start":
+            self._show_progress()
+            if self.accept_button:
+                self.accept_button.pack_forget()
+            self.action_button.configure(text="Cancel transfer")
             self.transfer_started_monotonic = time.monotonic()
             self.last_progress_monotonic = None
             self.set_details(
                 {
                     "State": "Transferring",
                     "Peer computer": data.get("peer", "Unknown"),
-                    "Peer IPv6": data.get("peer_ip", "Unknown"),
+                    "Peer address": data.get("peer_ip", "Unknown"),
                     "File count": data.get("file_count", 0),
                     "Total bytes": f"{human_bytes(data.get('total', 0))} ({data.get('total', 0)} bytes)",
                     "Integrity verification": "SHA-256 enabled" if data.get("verify") else "Disabled",
@@ -1985,6 +2732,7 @@ class TransferDialog(tk.Toplevel):
         elif action == "done":
             self.progress["value"] = 100
             self.percent_var.set("100.0%")
+            self.rate_var.set(f"{human_bytes(data.get('average_bps', 0))}/s")
             self.set_detail("Average speed", f"{human_bytes(data.get('average_bps', 0))}/s")
             if data.get("destination"):
                 self.set_detail("Receiver destination", data["destination"])
@@ -1994,11 +2742,17 @@ class TransferDialog(tk.Toplevel):
             self._finish("Declined", str(data.get("message") or "Transfer declined."))
 
         elif action == "cancelled":
-            if data.get("destination"):
+            if data.get("cleanup"):
+                self.set_detail("Cancellation cleanup", data["cleanup"])
+                self.destination_var.set(data["cleanup"])
+                self.add_log(data["cleanup"])
+            elif data.get("destination"):
                 self.set_detail("Partial data location", data["destination"])
             self._finish("Cancelled", str(data.get("message") or "Transfer cancelled."))
 
         elif action == "failed":
+            if data.get("cleanup"):
+                self.set_detail("Cancellation cleanup", data["cleanup"])
             if data.get("error_type"):
                 self.set_detail("Error type", data["error_type"])
             if data.get("destination"):
@@ -2006,6 +2760,7 @@ class TransferDialog(tk.Toplevel):
             self._finish("Failed", str(data.get("message") or "Transfer failed."))
 
     def _apply_progress(self, data: dict) -> None:
+        self._show_progress()
         now = time.monotonic()
         done = int(data.get("done") or 0)
         total = int(data.get("total") or 0)
@@ -2067,17 +2822,21 @@ class TransferDialog(tk.Toplevel):
         self.add_log(message)
         if self.accept_button:
             self.accept_button.config(state="disabled")
-        self.action_button.config(text="Close", state="normal", style="Accent.TButton")
+        group_panel = self.close_callback is None
+        self.action_button.config(text="Finished" if group_panel else "Done",
+                                  state="disabled" if group_panel else "normal", style="Accent.TButton")
+        if self.accept_button:
+            self.accept_button.pack_forget()
 
     def _tick(self) -> None:
-        if not self.winfo_exists():
+        if not self.winfo_exists() or self.finished:
             return
         start = self.transfer_started_monotonic or self.created_monotonic
         elapsed = time.monotonic() - start
         self.elapsed_var.set(human_duration(elapsed))
         self.set_detail("Elapsed time", human_duration(elapsed))
         self.set_detail("Seconds since last activity", f"{max(time.monotonic() - self.last_activity_monotonic, 0):.1f}")
-        self.after(250, self._tick)
+        self.winfo_toplevel().after(250, self._tick)
 
     def _cancel_or_close(self) -> None:
         if self.finished:
@@ -2101,116 +2860,247 @@ class TransferDialog(tk.Toplevel):
         self.clipboard_append("\n".join(lines))
         self.update()
 
-    def _minimize(self) -> None:
-        if self.minimized:
-            return
-        self.minimized = True
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        self.withdraw()
-        self.parent.iconify()
-        self.after(250, self._watch_for_restore)
-
-    def _watch_for_restore(self) -> None:
-        if not self.winfo_exists() or not self.minimized:
-            return
-        if self.parent.state() != "iconic":
-            self.minimized = False
-            self._activate_modal()
-            return
-        self.after(250, self._watch_for_restore)
-
     def _close(self) -> None:
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
         self.close_callback(self)
-        self.destroy()
 
 
-class EthernetSetupDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Tk):
-        super().__init__(parent)
+class TransferPanel(TransferView):
+    pass
+
+
+class GroupTransferDialog(tk.Frame):
+    def __init__(self, parent, recipients, paths, verify):
+        super().__init__(parent, bg=COLOR_BG)
         self.parent = parent
-        self.title(f"{APP_NAME} — Ethernet setup")
-        self.monitor_dpi, self.ui_scale = configure_tk_dpi(self)
-        set_scaled_window_geometry(self, 620, 350, 560, 320, self.ui_scale)
-        self.configure(background=COLOR_BG)
-        self.transient(parent)
-        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.transfer_id = "group"
+        self.finished = False
+        self.panels = {}
+        self.rows = {}
+        self.monitor_dpi, self.ui_scale = parent.monitor_dpi, parent.ui_scale
+        top = ttk.Frame(self, style="App.TFrame", padding=(32, 16))
+        top.pack(fill="x")
+        ttk.Label(top, text=f"{len(recipients)} receivers", style="Subtitle.TLabel").pack(side="left")
+        self.action_button = ttk.Button(top, text="Cancel all", style="Danger.TButton", command=self._cancel_or_close)
+        self.action_button.pack(side="right")
+        receivers = ttk.Frame(self, style="Card.TFrame")
+        receivers.pack(fill="x", padx=32)
+        self.summary = ttk.Treeview(receivers, columns=("status", "progress", "speed"), show="tree headings", height=min(len(recipients), 3))
+        for name, title in (("#0", "Receiver"), ("status", "Status"), ("progress", "Progress"), ("speed", "Speed")):
+            self.summary.heading(name, text=title)
+            self.summary.column(name, width=165, minwidth=100)
+        scroll = ttk.Scrollbar(receivers, orient="vertical", command=self.summary.yview)
+        self.summary.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self.summary.pack(fill="both", expand=True)
+        self.container = tk.Frame(self, bg=COLOR_BG)
+        self.container.pack(fill="both", expand=True)
+        self.container.monitor_dpi, self.container.ui_scale = self.monitor_dpi, self.ui_scale
+        for tid, peer in recipients.items():
+            self.summary.insert("", "end", iid=tid, text=peer["name"], values=("Preparing", "0%", "Waiting"))
+            self.rows[tid] = ["Preparing", "0%", "Waiting"]
+            self.panels[tid] = TransferPanel(self.container, tid, "Sending", parent.adapter,
+                lambda tid=tid: parent.sender.cancel(tid), None,
+                peer=peer["name"], peer_ip=peer["ip"], verify=verify, sources=paths)
+        self.summary.bind("<<TreeviewSelect>>", self._select)
+        self.summary.selection_set(next(iter(recipients)))
+        self._select()
 
-        outer = ttk.Frame(self, style="App.TFrame", padding=24)
-        outer.pack(fill="both", expand=True)
+    def _select(self, event=None):
+        finish_motion(self.container)
+        begin_motion(self.container)
+        for panel in self.panels.values():
+            panel.pack_forget()
+        selected = self.summary.selection()
+        if selected:
+            show_view(self.panels[selected[0]])
 
-        header = ttk.Frame(outer, style="App.TFrame")
-        header.pack(fill="x")
-        tk.Label(
-            header,
-            text="⚙",
-            bg=COLOR_ACCENT,
-            fg="#FFFFFF",
-            font=("Segoe UI Symbol", 18),
-            padx=10,
-            pady=7,
-        ).pack(side="left", padx=(0, 12))
-        heading = ttk.Frame(header, style="App.TFrame")
-        heading.pack(side="left")
-        ttk.Label(heading, text="Configuring direct Ethernet", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(heading, text="A Windows administrator prompt may appear", style="Subtitle.TLabel").pack(anchor="w")
+    def apply_transfer(self, tid, action, data):
+        panel = self.panels.get(tid)
+        if not panel:
+            return
+        panel.apply_event(action, data)
+        row = self.rows[tid]
+        if action in ("phase", "start", "prepared", "paused", "resumed", "done", "failed", "rejected", "cancelled"):
+            row[0] = data.get("phase") or {"done": "Completed", "rejected": "Declined", "failed": "Failed",
+                "cancelled": "Cancelled", "prepared": "Prepared", "start": "Transferring",
+                "paused": "Waiting to reconnect", "resumed": "Transferring"}.get(action, action)
+        if action in ("progress", "paused", "resumed"):
+            row[1], row[2] = panel.percent_var.get(), panel.rate_var.get()
+        if action == "done":
+            row[1] = "100%"
+        self.summary.item(tid, values=row)
 
-        self.progress = ttk.Progressbar(outer, mode="indeterminate", style="Modern.Horizontal.TProgressbar")
-        self.progress.pack(fill="x", pady=(22, 16))
-        self.progress.start(12)
+    def complete(self):
+        self.finished = True
+        self.action_button.configure(text="Done", style="Accent.TButton", state="normal")
 
-        card = ttk.Frame(outer, style="Card.TFrame", padding=16)
-        card.pack(fill="both", expand=True)
-        ttk.Label(card, text="EtherDrop is checking and configuring:", style="CardTitle.TLabel").pack(anchor="w")
-        ttk.Label(
-            card,
-            text=(
-                "✓ Physical wired adapter with no gateway\n"
-                "✓ IPv6 link-local communication\n"
-                "✓ Direct-link-only firewall rules\n"
-                "✓ Supported Ethernet power settings"
-            ),
-            style="CardMuted.TLabel",
-            justify="left",
-        ).pack(anchor="w", pady=(9, 0))
-        ttk.Label(
-            outer,
-            text="Wi-Fi, IPv4, DNS, DHCP, MTU, and router settings are never changed.",
-            style="Subtitle.TLabel",
-        ).pack(anchor="w", pady=(12, 0))
+    def set_detail(self, name, value):
+        for panel in self.panels.values():
+            panel.set_detail(name, value)
 
-        self.after_idle(self._activate)
+    def add_log(self, message):
+        for panel in self.panels.values():
+            panel.add_log(message)
 
-    def _activate(self) -> None:
-        self.lift()
-        self.focus_force()
-        self.grab_set()
+    def _cancel_or_close(self):
+        if self.finished:
+            self.parent._transfer_dialog_closed(self)
+        else:
+            self.parent.sender.cancel()
+            self.action_button.configure(text="Cancelling…", state="disabled")
 
-    def close(self) -> None:
-        self.progress.stop()
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
-        self.destroy()
+class WindowsFileDrop:
+    class Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    class Format(ctypes.Structure):
+        _fields_ = [("format", ctypes.c_ushort), ("device", ctypes.c_void_p),
+                    ("aspect", ctypes.c_uint), ("index", ctypes.c_long), ("medium", ctypes.c_uint)]
+
+    class Medium(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_uint), ("handle", ctypes.c_void_p), ("release", ctypes.c_void_p)]
+
+    def __init__(self, widget: tk.Widget, events: queue.Queue):
+        self.widget = widget
+        self.events = events
+        self.handle = widget.winfo_id()
+        self.enabled = False
+        self.accept_files = False
+        self.references = 1
+        self.shell32 = ctypes.windll.shell32
+        self.ole32 = ctypes.windll.ole32
+        self.user32 = ctypes.windll.user32
+        pointer, word = ctypes.c_void_p, ctypes.c_uint
+        effect = ctypes.POINTER(word)
+        self.user32.GetAncestor.argtypes, self.user32.GetAncestor.restype = [pointer, word], pointer
+        self.user32.GetWindowRect.argtypes = [pointer, pointer]
+        self.window_handle = self.user32.GetAncestor(self.handle, 2)
+        self.shell32.DragQueryFileW.argtypes = [pointer, word, ctypes.c_wchar_p, word]
+        self.shell32.DragQueryFileW.restype = word
+        self.ole32.OleInitialize.argtypes = [pointer]
+        self.ole32.RegisterDragDrop.argtypes = [pointer, pointer]
+        self.ole32.RevokeDragDrop.argtypes = [pointer]
+        self.ole32.ReleaseStgMedium.argtypes = [pointer]
+        self.file_format = self.Format(15, None, 1, -1, 1)  # CF_HDROP, DVASPECT_CONTENT, TYMED_HGLOBAL
+        methods = [
+            (ctypes.c_long, (pointer, pointer, ctypes.POINTER(pointer)), self._query_interface),
+            (word, (pointer,), self._add_ref),
+            (word, (pointer,), self._release),
+            (ctypes.c_long, (pointer, pointer, word, self.Point, effect), self._drag_enter),
+            (ctypes.c_long, (pointer, word, self.Point, effect), self._drag_over),
+            (ctypes.c_long, (pointer,), self._drag_leave),
+            (ctypes.c_long, (pointer, pointer, word, self.Point, effect), self._drop),
+        ]
+        # Windows calls these while Tcl is waiting for messages: only native APIs and the queue are used.
+        self.callbacks = [ctypes.WINFUNCTYPE(result, *args)(method) for result, args, method in methods]
+        self.table = (pointer * len(self.callbacks))(*(ctypes.cast(method, pointer) for method in self.callbacks))
+        self.object = (pointer * 1)(ctypes.cast(self.table, pointer))
+        self.interface = ctypes.cast(self.object, pointer)
+        result = self.ole32.OleInitialize(None)
+        if result < 0:
+            raise ctypes.WinError(result)
+        # Explorer targets the actual top-level window; the drop effect restricts it to the list.
+        result = self.ole32.RegisterDragDrop(self.window_handle, self.interface)
+        if result < 0:
+            self.ole32.OleUninitialize()
+            raise ctypes.WinError(result)
+        widget.bind("<Map>", lambda event: self._enable(True), add="+")
+        widget.bind("<Unmap>", lambda event: self._enable(False), add="+")
+        widget.bind("<Destroy>", self._destroy, add="+")
+
+    def _enable(self, enabled):
+        self.enabled = enabled
+
+    def _query_interface(self, this, iid, output):
+        if ctypes.string_at(iid, 16) not in (
+                uuid.UUID("00000000-0000-0000-c000-000000000046").bytes_le,
+                uuid.UUID("00000122-0000-0000-c000-000000000046").bytes_le):
+            output[0] = None
+            return -2147467262  # E_NOINTERFACE
+        output[0] = this
+        self._add_ref(this)
+        return 0
+
+    def _add_ref(self, this):
+        self.references += 1
+        return self.references
+
+    def _release(self, this):
+        self.references -= 1
+        return self.references
+
+    def _data_call(self, data, index, *args):
+        pointer = ctypes.c_void_p
+        table = ctypes.cast(data, ctypes.POINTER(ctypes.POINTER(pointer))).contents
+        method = ctypes.WINFUNCTYPE(ctypes.c_long, pointer, *([pointer] * len(args)))(table[index])
+        return method(data, *args)
+
+    def _set_effect(self, point, effect):
+        rect = (ctypes.c_long * 4)()
+        allowed = (self.enabled and self.accept_files
+                   and self.user32.GetWindowRect(self.handle, rect)
+                   and rect[0] <= point.x < rect[2] and rect[1] <= point.y < rect[3])
+        effect[0] = effect[0] & 1 if allowed else 0  # DROPEFFECT_COPY; never move source files.
+
+    def _drag_enter(self, this, data, keys, point, effect):
+        self.accept_files = self._data_call(data, 5, ctypes.byref(self.file_format)) == 0
+        self._set_effect(point, effect)
+        return 0
+
+    def _drag_over(self, this, keys, point, effect):
+        self._set_effect(point, effect)
+        return 0
+
+    def _drag_leave(self, this):
+        self.accept_files = False
+        return 0
+
+    def _drop(self, this, data, keys, point, effect):
+        self._set_effect(point, effect)
+        if effect[0]:
+            medium = self.Medium()
+            result = self._data_call(data, 3, ctypes.byref(self.file_format), ctypes.byref(medium))
+            if result < 0:
+                effect[0] = 0
+                return result
+            try:
+                paths = []
+                count = self.shell32.DragQueryFileW(medium.handle, 0xFFFFFFFF, None, 0)
+                for index in range(count):
+                    size = self.shell32.DragQueryFileW(medium.handle, index, None, 0) + 1
+                    name = ctypes.create_unicode_buffer(size)
+                    self.shell32.DragQueryFileW(medium.handle, index, name, size)
+                    paths.append(name.value)
+                self.events.put(("files_dropped", self.widget, paths))
+            finally:
+                self.ole32.ReleaseStgMedium(ctypes.byref(medium))
+        self.accept_files = False
+        return 0
+
+    def _destroy(self, event):
+        self._enable(False)
+        self.ole32.RevokeDragDrop(self.window_handle)
+        self.ole32.OleUninitialize()
 
 
 class EtherDropApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.monitor_dpi, self.ui_scale = configure_tk_dpi(self)
+        assets = Path(__file__).resolve().parent / "assets"
+        self.iconbitmap(default=str(assets / "etherdrop.ico"))
         configure_modern_theme(self)
         self.title(APP_NAME)
-        set_scaled_window_geometry(self, 840, 700, 760, 610, self.ui_scale)
+        set_scaled_window_geometry(self, 880, 820, 820, 820, self.ui_scale)
+        self.motion_callback = None
+        self.motion_parent = None
+        self.motion_prepared = False
 
         self.events: queue.Queue = queue.Queue()
         self.coordinator = threading.Lock()
+        self.close_after_transfer = False
+        self.mode = "ethernet"
+        self.wifi_peers = {}
         self.role: str | None = None
         self.adapter: EthernetAdapter | None = None
         self.discovery: DiscoveryService | None = None
@@ -2223,7 +3113,7 @@ class EtherDropApp(tk.Tk):
         self.peer_last_seen = 0.0
         self.selected_paths: list[Path] = []
         self.last_destination = Path.home() / "Downloads"
-        self.transfer_dialog: TransferDialog | None = None
+        self.transfer_dialog: TransferView | GroupTransferDialog | None = None
         self.active_transfer_id: str | None = None
         self.keep_awake_active = False
         self.scan_token = 0
@@ -2232,17 +3122,28 @@ class EtherDropApp(tk.Tk):
         self.progress: ttk.Progressbar | None = None
         self.link_label: ttk.Label | None = None
         self.setup_button: ttk.Button | None = None
-        self.setup_dialog: EthernetSetupDialog | None = None
+        self.setup_dialog: tk.Frame | None = None
         self.setup_in_progress = False
         self.update_busy = False
         self._closing = False
         self.update_installing = False
         self.update_button: ttk.Button | None = None
-        self.update_dialog: tk.Toplevel | None = None
-        self.release_notes_dialog: tk.Toplevel | None = None
+        self.update_dialog: tk.Frame | None = None
+        self.release_notes_dialog: tk.Frame | None = None
         self.update_state = load_update_state()
         self.update_var = tk.StringVar(value="Check for updates")
+        self.update_progress_var = tk.DoubleVar(value=0)
 
+        self.screen = None
+        self.page = None
+        self.page_neutral = False
+        self.page_close_callback = None
+        self.connection_error = ""
+        self.connection_state = None
+        self.peer_tree = None
+        self.connection_summary_var = tk.StringVar(value="Searching…")
+        self.selection_var = tk.StringVar(value="No files selected")
+        self.selected_path_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Connect the two laptops directly with Ethernet.")
         self.adapter_var = tk.StringVar(value="Ethernet: not detected")
         self.peer_var = tk.StringVar(value="Peer: searching…")
@@ -2250,8 +3151,12 @@ class EtherDropApp(tk.Tk):
         self.sync_var = tk.StringVar(value="Waiting for a live heartbeat from the other laptop.")
         self.speed_var = tk.StringVar(value="")
         self.current_var = tk.StringVar(value="")
+        self.wrap_var = tk.BooleanVar(value=True)
         self.verify_var = tk.BooleanVar(value=False)
 
+        for mode in THEMES:
+            apply_mode_theme(self, mode)
+        apply_mode_theme(self, self.mode)
         self._build_role_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(100, self._drain_events)
@@ -2260,21 +3165,61 @@ class EtherDropApp(tk.Tk):
         self.after(300, self._show_startup_notes)
 
     def _clear_window(self) -> None:
+        begin_motion(self)
+        self._dismiss_page(animate=False)
         for child in self.winfo_children():
-            child.destroy()
+            if child is not getattr(self, "motion_overlay", None):
+                child.destroy()
         self.link_label = None
         self.setup_button = None
         self.update_button = None
+        self.listbox = None
+        self.send_button = None
+        self.connection_state = None
+        self.peer_tree = None
+
+    def _show_page(self, title, back_text="Back", close_callback=None, neutral=False):
+        begin_motion(self)
+        self._dismiss_page(animate=False)
+        self.page_neutral = neutral
+        if neutral:
+            apply_mode_theme(self, "neutral")
+        self.page = ttk.Frame(self, style="App.TFrame", padding=(32, 24))
+        show_view(self.page, self.screen)
+        self.page_close_callback = close_callback
+        header = ttk.Frame(self.page, style="App.TFrame")
+        header.pack(fill="x", pady=(0, 18))
+        ttk.Button(header, text=back_text, image=icon_image(self, "arrow-left"), compound="left",
+                   command=self._dismiss_page, style="Ghost.TButton").pack(side="left")
+        if not neutral:
+            mode_badge(header, self.mode).pack(side="right")
+        ttk.Label(self.page, text=title, style="Title.TLabel").pack(anchor="w", pady=(0, 18))
+        return self.page
+
+    def _dismiss_page(self, animate=True):
+        if self.page is not None:
+            if animate:
+                begin_motion(self)
+            callback = self.page_close_callback
+            self.page.destroy()
+            self.page = None
+            self.page_close_callback = None
+            if self.page_neutral:
+                apply_mode_theme(self, self.mode)
+                self.page_neutral = False
+            if callback:
+                callback()
+            if self.screen is not None and self.screen.winfo_exists():
+                show_view(self.screen, animate=animate)
 
     def _build_update_button(self, parent: ttk.Frame) -> None:
         controls = ttk.Frame(parent, style="App.TFrame")
-        controls.pack(side="right")
-        self.update_button = ttk.Button(
-            controls, textvariable=self.update_var, command=lambda: self.check_for_updates(manual=True),
-        )
+        controls.pack(side="right", anchor="n")
+        self.update_button = ttk.Button(controls, textvariable=self.update_var,
+            command=lambda: self.check_for_updates(manual=True), style="Ghost.TButton")
         self.update_button.pack(anchor="e")
+        ttk.Label(controls, text=f"Version {APP_VERSION}", style="Small.TLabel").pack(anchor="e", padx=10, pady=(2, 0))
         self.update_button.configure(state="disabled" if self.update_busy else "normal")
-        ttk.Label(controls, text=f"v{APP_VERSION}", style="Subtitle.TLabel").pack(anchor="e", pady=(3, 0))
 
     def _set_update_busy(self, busy: bool, text: str = "Check for updates") -> None:
         self.update_busy = busy
@@ -2305,38 +3250,37 @@ class EtherDropApp(tk.Tk):
                 notes = release["notes"] if release and version_tuple(release["version"]) == version_tuple(APP_VERSION) else bundled_release_notes()
                 self._show_release_notes("You're up to date", notes)
             return
+        page = self._show_page("Update available", neutral=True)
+        ttk.Label(page, text=f"EtherDrop {release['version']} · Installed v{APP_VERSION}", style="Subtitle.TLabel").pack(anchor="w")
+        self._notes_body(page, release["notes"])
         if not getattr(sys, "frozen", False):
-            messagebox.showinfo(
-                APP_NAME, f"{release['version']} is available. Self-updating is available in the standalone EXE.\n"
-                f"Download it from https://github.com/{GITHUB_REPOSITORY}/releases/latest", parent=self,
-            )
-            return
-        if not messagebox.askyesno(
-            APP_NAME, f"EtherDrop {release['version']} is available (current: v{APP_VERSION}).\n\n"
-            "Download it now? EtherDrop will close briefly, update itself, and reopen.", parent=self,
-        ):
-            return
+            ttk.Label(page, text="Self-updating is available in the standalone EXE. Download the latest EXE from GitHub.",
+                      style="Subtitle.TLabel", wraplength=700).pack(anchor="w", pady=12)
+            ttk.Button(page, text="Open releases", command=lambda: os.startfile(f"https://github.com/{GITHUB_REPOSITORY}/releases/latest")).pack(anchor="e")
+        else:
+            ttk.Label(page, text="EtherDrop will close briefly, install the update, and reopen.", style="Subtitle.TLabel").pack(anchor="w", pady=12)
+            ttk.Button(page, text="Download & restart", command=lambda: self._download_offered_update(release), style="Accent.TButton").pack(anchor="e")
+
+    def _download_offered_update(self, release):
+        page = self._show_page("Updating EtherDrop", neutral=True)
+        for child in page.winfo_children():
+            if isinstance(child, ttk.Frame):
+                child.destroy()
+        self.update_dialog = page
         self._set_update_busy(True, "Downloading…")
         self.update_installing = True
-        dialog = tk.Toplevel(self)
-        self.update_dialog = dialog
-        dialog.title("Updating EtherDrop")
-        configure_modern_theme(dialog)
-        dialog.transient(self)
-        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
-        content = ttk.Frame(dialog, style="App.TFrame", padding=24)
-        content.pack(fill="both", expand=True)
-        ttk.Label(content, text=f"Downloading {release['version']}", style="CardTitle.TLabel").pack(anchor="w")
-        ttk.Label(content, textvariable=self.update_var, style="Subtitle.TLabel").pack(anchor="w", pady=(12, 0))
-        ttk.Label(content, text="EtherDrop will restart when the download finishes.", style="Subtitle.TLabel").pack(pady=(12, 0))
-        dialog.grab_set()
+        self.update_progress_var.set(0)
+        self.update_var.set(f"0.0 / {release['asset']['size'] / 1_000_000:.1f} MB · 0.0 MB/s")
+        ttk.Label(page, textvariable=self.update_var, style="Subtitle.TLabel").pack(anchor="w", pady=16)
+        ttk.Progressbar(page, maximum=100, variable=self.update_progress_var,
+                        style="Modern.Horizontal.TProgressbar").pack(fill="x", pady=(0, 16))
+        ttk.Label(page, text="EtherDrop will restart when the download finishes.", style="Subtitle.TLabel").pack(anchor="w")
 
         def worker():
             try:
                 self.events.put(("update_downloaded", download_update(release, self.events)))
             except Exception as exc:
                 self.events.put(("update_error", str(exc), True))
-
         threading.Thread(target=worker, daemon=True).start()
 
     def _show_startup_notes(self) -> None:
@@ -2348,30 +3292,19 @@ class EtherDropApp(tk.Tk):
         title = "EtherDrop updated" if self.update_state.get("seen_version") else "Welcome to EtherDrop"
         self._show_release_notes(title, bundled_release_notes())
 
-    def _show_release_notes(self, title: str, notes: str) -> None:
-        dialog = tk.Toplevel(self)
-        self.release_notes_dialog = dialog
-        dialog.title(f"{APP_NAME} — What's new")
-        configure_modern_theme(dialog)
-        set_scaled_window_geometry(dialog, 620, 440, 440, 320, self.ui_scale)
-        dialog.transient(self)
-        outer = ttk.Frame(dialog, style="App.TFrame", padding=24)
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text=title, style="Title.TLabel").pack(anchor="w")
-        ttk.Label(outer, text=f"EtherDrop v{APP_VERSION}", style="Subtitle.TLabel").pack(anchor="w", pady=(4, 16))
-        body = ttk.Frame(outer, style="Panel.TFrame")
-        body.pack(fill="both", expand=True)
-        text = tk.Text(
-            body, wrap="word", bg=COLOR_PANEL, fg=COLOR_TEXT, font=("Segoe UI", 10),
-            relief="flat", padx=14, pady=12, borderwidth=0,
-        )
-        scrollbar = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+    def _notes_body(self, parent, notes):
+        body = RoundedCard(parent, padding=16, height=280)
+        body.pack(fill="x", pady=(16, 0))
+        text = tk.Text(body.body, wrap="word", bg=COLOR_SURFACE, fg=COLOR_TEXT, font=("Segoe UI", 11),
+                       relief="flat", padx=8, pady=8, borderwidth=0)
+        scrollbar = ttk.Scrollbar(body.body, orient="vertical", command=text.yview)
         scrollbar.pack(side="right", fill="y")
         text.pack(fill="both", expand=True)
         text.configure(yscrollcommand=scrollbar.set)
         text.insert("1.0", notes)
         text.configure(state="disabled")
 
+    def _show_release_notes(self, title: str, notes: str) -> None:
         def close():
             self.update_state["seen_version"] = APP_VERSION
             try:
@@ -2379,138 +3312,83 @@ class EtherDropApp(tk.Tk):
             except OSError:
                 pass
             self.release_notes_dialog = None
-            dialog.destroy()
-
-        dialog.protocol("WM_DELETE_WINDOW", close)
-        ttk.Button(outer, text="Continue", command=close, style="Accent.TButton").pack(anchor="e", pady=(16, 0))
-        dialog.grab_set()
+        page = self._show_page(title, close_callback=close, neutral=True)
+        self.release_notes_dialog = page
+        ttk.Label(page, text=f"What's new in EtherDrop {APP_VERSION}", style="Subtitle.TLabel").pack(anchor="w")
+        self._notes_body(page, notes)
+        ttk.Button(page, text="Continue", command=self._dismiss_page, style="Accent.TButton").pack(anchor="e", pady=(20, 0))
 
     def _handle_update_error(self, message: str, manual: bool) -> None:
         if self.update_dialog:
-            self.update_dialog.destroy()
+            self._dismiss_page()
             self.update_dialog = None
         self.update_installing = False
         self._set_update_busy(False)
         if manual:
-            messagebox.showerror(APP_NAME, f"Could not update EtherDrop.\n\n{message}", parent=self)
+            self._show_message("Couldn't update EtherDrop", message, neutral=True)
+
+    def _show_message(self, title, message, neutral=False):
+        page = self._show_page(title, neutral=neutral)
+        ttk.Label(page, text=message, style="Subtitle.TLabel", wraplength=720, justify="left").pack(anchor="w")
+        ttk.Button(page, text="Done", command=self._dismiss_page, style="Accent.TButton").pack(anchor="e", side="bottom")
 
     def _build_role_ui(self) -> None:
         self._clear_window()
-        set_scaled_window_geometry(self, 820, 600, 720, 560, self.ui_scale)
-        outer = ttk.Frame(self, style="App.TFrame", padding=34)
-        outer.pack(fill="both", expand=True)
+        outer = ttk.Frame(self, style="App.TFrame", padding=(48, 28))
+        self.screen = outer
+        show_view(outer)
+        top = ttk.Frame(outer, style="App.TFrame")
+        top.pack(fill="x")
+        ttk.Label(top, text="EtherDrop", style="Hero.TLabel").pack(side="left", anchor="n")
+        self._build_update_button(top)
+        intro = ttk.Frame(outer, style="App.TFrame")
+        intro.pack(fill="x", pady=(8, 32))
+        ttk.Label(intro, text="Send and receive files nearby.", style="Subtitle.TLabel").pack(anchor="w", pady=(8, 0))
+        modes = ttk.Frame(outer, style="App.TFrame")
+        ttk.Label(outer, text="Connection", style="Subtitle.TLabel").pack(anchor="w", pady=(0, 10))
+        modes.pack(anchor="w", pady=(0, 16))
+        for mode, label in (("ethernet", "Ethernet"), ("wifi", "Wi-Fi")):
+            ttk.Button(modes, text=label, image=icon_image(self, "wifi" if mode == "wifi" else "ethernet-port", "ink" if self.mode == mode else "muted"),
+                compound="left", command=lambda mode=mode: self._select_mode(mode),
+                style="SelectedSegment.TButton" if self.mode == mode else "Segment.TButton").pack(side="left", padx=(0, 4))
+        ttk.Label(outer, text="Connect with a cable between the laptops." if self.mode == "ethernet" else "Connect every laptop to the same Wi-Fi network.",
+                  style="Subtitle.TLabel").pack(anchor="w", pady=(0, 24))
+        ttk.Label(outer, text="Start a transfer", style="Title.TLabel", font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(16, 16))
+        roles = ttk.Frame(outer, style="App.TFrame")
+        roles.pack(anchor="w", pady=(8, 0))
+        for role, title, description, icon in (
+            ("sender", "Send files", "Choose files and folders to share.", "upload"),
+            ("receiver", "Receive files", "Review incoming files and choose where to save them.", "download"),
+        ):
+            ttk.Button(roles, text=f"   {title}\n   {description}", width=43,
+                       image=icon_image(self, icon, self.mode, 36), compound="left",
+                       command=lambda role=role: self.select_role(role),
+                       style="Role.TButton").pack(fill="x", pady=(0, 12))
+        footer = ttk.Frame(outer, style="App.TFrame")
+        footer.pack(fill="x", side="bottom", pady=(18, 0))
+        ttk.Button(footer, text="How it works", command=self._show_help, style="Ghost.TButton").pack(side="right")
 
-        update_header = ttk.Frame(outer, style="App.TFrame")
-        update_header.pack(fill="x")
-        self._build_update_button(update_header)
+    def _show_help(self):
+        page = self._show_page("How it works")
+        text = ("1. Connect both laptops with Ethernet, or join the same Wi-Fi network.\n\n"
+                "2. Choose Send on one laptop and Receive on the others.\n\n"
+                "3. Add files or folders, then send. Every receiver chooses a destination and approves independently.\n\n"
+                "Ethernet uses an isolated physical wired adapter with no gateway. Wi-Fi sends to all discovered receivers.\n\n"
+                "Open Connection for adapter details and setup. During a transfer, Details contains the full diagnostics and activity log.")
+        ttk.Label(page, text=text, style="Subtitle.TLabel", wraplength=700, justify="left").pack(anchor="w")
 
-        brand = tk.Label(
-            outer,
-            text="ED",
-            bg=COLOR_ACCENT,
-            fg="#FFFFFF",
-            font=("Segoe UI", 13, "bold"),
-            width=3,
-            height=1,
-            padx=4,
-            pady=7,
-        )
-        brand.pack(anchor="center", pady=(6, 14))
-        ttk.Label(outer, text="EtherDrop", style="Hero.TLabel").pack(anchor="center")
-        ttk.Label(
-            outer,
-            text="Direct cable. Full speed. Zero cloud.",
-            style="Subtitle.TLabel",
-        ).pack(anchor="center", pady=(4, 6))
-        ttk.Label(outer, text="Choose this laptop’s role", style="Title.TLabel").pack(
-            anchor="center", pady=(12, 22)
-        )
-
-        choices = ttk.Frame(outer, style="App.TFrame")
-        choices.pack(fill="both", expand=True)
-        choices.columnconfigure(0, weight=1)
-        choices.columnconfigure(1, weight=1)
-        choices.rowconfigure(0, weight=1)
-
-        send_border = tk.Frame(choices, bg=COLOR_BORDER, padx=1, pady=1)
-        send_border.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        send_box = tk.Frame(send_border, bg=COLOR_SURFACE, padx=22, pady=20)
-        send_box.pack(fill="both", expand=True)
-        tk.Label(send_box, text="↑", bg=COLOR_SURFACE, fg=COLOR_ACCENT, font=("Segoe UI", 25, "bold")).pack(
-            anchor="w"
-        )
-        tk.Label(send_box, text="Send", bg=COLOR_SURFACE, fg=COLOR_TEXT, font=("Segoe UI", 16, "bold")).pack(
-            anchor="w", pady=(7, 3)
-        )
-        tk.Label(
-            send_box,
-            text="Choose files and folders, then push them across the direct Ethernet link.",
-            bg=COLOR_SURFACE,
-            fg=COLOR_MUTED,
-            font=("Segoe UI", 10),
-            justify="left",
-            wraplength=290,
-        ).pack(anchor="w")
-        tk.Label(
-            send_box,
-            text="SELECT  •  REVIEW  •  SEND",
-            bg=COLOR_SURFACE,
-            fg=COLOR_ACCENT,
-            font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w", pady=(15, 12))
-        ttk.Button(
-            send_box,
-            text="Continue as sender  →",
-            command=lambda: self.select_role("sender"),
-            style="Accent.TButton",
-        ).pack(fill="x", side="bottom")
-
-        receive_border = tk.Frame(choices, bg=COLOR_BORDER, padx=1, pady=1)
-        receive_border.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        receive_box = tk.Frame(receive_border, bg=COLOR_SURFACE, padx=22, pady=20)
-        receive_box.pack(fill="both", expand=True)
-        tk.Label(receive_box, text="↓", bg=COLOR_SURFACE, fg=COLOR_CYAN, font=("Segoe UI", 25, "bold")).pack(
-            anchor="w"
-        )
-        tk.Label(
-            receive_box,
-            text="Receive",
-            bg=COLOR_SURFACE,
-            fg=COLOR_TEXT,
-            font=("Segoe UI", 16, "bold"),
-        ).pack(anchor="w", pady=(7, 3))
-        tk.Label(
-            receive_box,
-            text="Review every offer and choose exactly where the incoming transfer is saved.",
-            bg=COLOR_SURFACE,
-            fg=COLOR_MUTED,
-            font=("Segoe UI", 10),
-            justify="left",
-            wraplength=290,
-        ).pack(anchor="w")
-        tk.Label(
-            receive_box,
-            text="APPROVE  •  LOCATE  •  RECEIVE",
-            bg=COLOR_SURFACE,
-            fg=COLOR_CYAN,
-            font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w", pady=(15, 12))
-        ttk.Button(
-            receive_box,
-            text="Continue as receiver  →",
-            command=lambda: self.select_role("receiver"),
-            style="Cyan.TButton",
-        ).pack(fill="x", side="bottom")
-
-        ttk.Label(
-            outer,
-            text="Choose opposite roles on the two laptops — EtherDrop handles the pairing.",
-            style="Subtitle.TLabel",
-        ).pack(anchor="center", pady=(18, 0))
+    def _select_mode(self, mode):
+        if mode == self.mode and self.screen is not None:
+            return
+        begin_motion(self)
+        self.mode = mode
+        apply_mode_theme(self, mode)
+        self._build_role_ui()
 
     def select_role(self, role: str) -> None:
         if role not in ("sender", "receiver"):
             return
+        begin_motion(self)
         self.shutdown_services()
         self.role = role
         self._build_main_ui()
@@ -2518,181 +3396,162 @@ class EtherDropApp(tk.Tk):
 
     def _build_main_ui(self) -> None:
         self._clear_window()
-        set_scaled_window_geometry(self, 860, 730, 760, 610, self.ui_scale)
-        outer = ttk.Frame(self, style="App.TFrame", padding=24)
-        outer.pack(fill="both", expand=True)
-
+        outer = ttk.Frame(self, style="App.TFrame", padding=(32, 24))
+        self.screen = outer
+        show_view(outer)
         header = ttk.Frame(outer, style="App.TFrame")
         header.pack(fill="x")
-        brand = tk.Label(
-            header,
-            text="ED",
-            bg=COLOR_ACCENT,
-            fg="#FFFFFF",
-            font=("Segoe UI", 10, "bold"),
-            padx=9,
-            pady=7,
-        )
-        brand.pack(side="left", padx=(0, 11))
-        title_stack = ttk.Frame(header, style="App.TFrame")
-        title_stack.pack(side="left")
-        ttk.Label(title_stack, text="EtherDrop", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(title_stack, text="Direct Ethernet transfer", style="Subtitle.TLabel").pack(anchor="w")
-        ttk.Label(
-            header,
-            text="SENDER" if self.role == "sender" else "RECEIVER",
-            style="RoleBadge.TLabel" if self.role == "sender" else "ReceiverBadge.TLabel",
-        ).pack(side="right")
-
-        info = ttk.Frame(outer, style="Card.TFrame", padding=16)
-        info.pack(fill="x", pady=(18, 0))
-        info_top = ttk.Frame(info, style="Card.TFrame")
-        info_top.pack(fill="x")
-        self.link_label = ttk.Label(info_top, textvariable=self.link_var, style="Waiting.TLabel")
-        self.link_label.pack(side="left")
-        tk.Label(
-            info_top,
-            text="DIRECT ETHERNET",
-            bg=COLOR_SURFACE_ALT,
-            fg=COLOR_MUTED,
-            font=("Segoe UI", 8, "bold"),
-            padx=9,
-            pady=4,
-        ).pack(side="right")
-        ttk.Label(info, textvariable=self.adapter_var, style="CardMuted.TLabel").pack(anchor="w", pady=(9, 0))
-        ttk.Label(info, textvariable=self.peer_var, style="Card.TLabel").pack(anchor="w", pady=(5, 0))
-        ttk.Label(info, textvariable=self.sync_var, style="CardMuted.TLabel").pack(anchor="w", pady=(3, 0))
-        connection_buttons = ttk.Frame(info, style="Card.TFrame")
-        connection_buttons.pack(fill="x", pady=(11, 0))
-        ttk.Button(connection_buttons, text="←  Change role", command=self._change_role, style="Ghost.TButton").pack(
-            side="left"
-        )
-        self.setup_button = ttk.Button(
-            connection_buttons,
-            text="Auto-configure Ethernet",
-            command=self.auto_configure_ethernet,
-            style="Cyan.TButton",
-        )
-        self.setup_button.pack(side="right")
-        ttk.Button(connection_buttons, text="Rescan", command=self.rescan).pack(side="right", padx=(0, 8))
-
+        ttk.Button(header, text="Back", image=icon_image(self, "arrow-left"), compound="left",
+                   command=self._change_role, style="Ghost.TButton").pack(side="left")
+        mode_badge(header, self.mode).pack(side="right")
+        ttk.Label(outer, text="Send files" if self.role == "sender" else "Receive files", style="Title.TLabel").pack(anchor="w", pady=(20, 18))
+        info = ttk.Frame(outer, style="App.TFrame")
+        info.pack(fill="x", pady=(0, 14))
+        ttk.Label(info, textvariable=self.connection_summary_var, style="Subtitle.TLabel").pack(side="left")
+        ttk.Button(info, text="Connection", command=self._show_connection,
+                   style="Ghost.TButton").pack(side="right")
+        self.main_content = ttk.Frame(outer, style="App.TFrame")
+        self.main_content.pack(fill="both", expand=True)
+        self.file_workspace = ttk.Frame(self.main_content, style="App.TFrame")
+        self.connection_state = ttk.Frame(self.main_content, style="App.TFrame")
+        center = ttk.Frame(self.connection_state, style="App.TFrame")
+        center.place(relx=.5, rely=.43, anchor="center")
+        self.state_icon = tk.Label(center, bg=COLOR_BG)
+        self.state_icon.pack(pady=(0, 18))
+        self.state_title = ttk.Label(center, style="Title.TLabel")
+        self.state_title.pack()
+        self.state_message = ttk.Label(center, style="Subtitle.TLabel", wraplength=580, justify="center")
+        self.state_message.pack(pady=(10, 0))
+        self.state_actions = ttk.Frame(center, style="App.TFrame")
+        self.state_actions.pack(pady=(24, 0))
+        ttk.Button(self.state_actions, text="Rescan", image=icon_image(self, "refresh-cw", "muted"),
+                   compound="left", command=self.rescan).pack(side="left")
+        ttk.Button(self.state_actions, text="Connection settings", command=self._show_connection,
+                   style="Ghost.TButton").pack(side="left", padx=(8, 0))
         if self.role == "sender":
-            files = ttk.Frame(outer, style="Card.TFrame", padding=16)
-            files.pack(fill="both", expand=True, pady=(14, 0))
-
-            section_head = ttk.Frame(files, style="Card.TFrame")
-            section_head.pack(fill="x", pady=(0, 10))
-            section_title = ttk.Frame(section_head, style="Card.TFrame")
-            section_title.pack(side="left")
-            ttk.Label(section_title, text="Transfer contents", style="CardTitle.TLabel").pack(anchor="w")
-            ttk.Label(section_title, text="Add any mix of files and folders", style="CardMuted.TLabel").pack(anchor="w")
-
-            buttons = ttk.Frame(section_head, style="Card.TFrame")
-            buttons.pack(side="right")
-            ttk.Button(buttons, text="＋ Files", command=self.add_files, style="Accent.TButton").pack(side="left")
-            ttk.Button(buttons, text="＋ Folder", command=self.add_folder).pack(side="left", padx=(7, 0))
-            ttk.Button(buttons, text="Clear", command=self.clear_selection, style="Ghost.TButton").pack(
-                side="left", padx=(7, 0)
-            )
-
-            self.listbox = tk.Listbox(
-                files,
-                height=6,
-                activestyle="none",
-                bg=COLOR_PANEL,
-                fg=COLOR_TEXT,
-                selectbackground=COLOR_ACCENT,
-                selectforeground="#FFFFFF",
-                highlightbackground=COLOR_BORDER,
-                highlightcolor=COLOR_ACCENT,
-                highlightthickness=1,
-                relief="flat",
-                borderwidth=0,
-                font=("Segoe UI", 10),
-            )
-            self.listbox.pack(fill="both", expand=True, pady=(0, 10), ipady=5)
-
-            opts = ttk.Frame(files, style="Card.TFrame")
-            opts.pack(fill="x")
-            ttk.Checkbutton(
-                opts,
-                text="Verify every file with SHA-256",
-                variable=self.verify_var,
-                style="Card.TCheckbutton",
-            ).pack(side="left")
-
-            self.send_button = ttk.Button(
-                opts,
-                text="Send now  →",
-                command=self.send_selected,
-                state="disabled",
-                style="Accent.TButton",
-            )
-            self.send_button.pack(side="right")
+            files = RoundedCard(self.file_workspace, height=280)
+            files.pack(fill="both", expand=True)
+            section_head = ttk.Frame(files.body, style="Card.TFrame")
+            section_head.pack(fill="x", pady=(0, 14))
+            ttk.Label(section_head, textvariable=self.selection_var, style="CardTitle.TLabel").pack(side="left")
+            ttk.Button(section_head, text="Clear", command=self.clear_selection, style="Link.TButton").pack(side="right")
+            buttons = ttk.Frame(files.body, style="Card.TFrame")
+            buttons.pack(fill="x", pady=(0, 12))
+            ttk.Button(buttons, text="Add files…", image=icon_image(self, "file", "muted"), compound="left", command=self.add_files, style="Card.TButton").pack(side="left")
+            ttk.Button(buttons, text="Add folder…", image=icon_image(self, "folder", "muted"), compound="left", command=self.add_folder, style="Card.TButton").pack(side="left", padx=(8, 0))
+            file_list = ttk.Frame(files.body, style="Card.TFrame")
+            file_list.pack(fill="both", expand=True)
+            self.listbox = tk.Listbox(file_list, height=4, activestyle="none", bg=COLOR_SURFACE, fg=COLOR_TEXT,
+                selectbackground=COLOR_SURFACE_ALT, selectforeground=COLOR_TEXT, highlightthickness=0,
+                relief="flat", borderwidth=0, font=("Segoe UI", 11))
+            scroll = ttk.Scrollbar(file_list, orient="vertical", command=self.listbox.yview)
+            self.listbox.configure(yscrollcommand=scroll.set)
+            scroll.pack(side="right", fill="y")
+            self.listbox.pack(fill="both", expand=True)
+            self.listbox.bind("<<ListboxSelect>>", self._selected_file_changed)
+            self.listbox.file_drop = WindowsFileDrop(self.listbox, self.events)
+            ttk.Label(files.body, textvariable=self.selected_path_var, style="CardMuted.TLabel", wraplength=740).pack(anchor="w", pady=(8, 0))
+            footer = ttk.Frame(self.file_workspace, style="App.TFrame")
+            footer.pack(fill="x", pady=(18, 0))
+            ttk.Button(footer, text="Transfer options", image=icon_image(self, "settings-2", "muted"), compound="left",
+                       command=self._show_transfer_options, style="Ghost.TButton").pack(side="left")
+            self.send_button = ttk.Button(footer, text="Send", command=self.send_selected, state="disabled", style="Accent.TButton")
+            self.send_button.pack(side="right", ipadx=25)
             self.refresh_list()
-        else:
-            waiting = ttk.Frame(outer, style="Card.TFrame", padding=22)
-            waiting.pack(fill="both", expand=True, pady=(14, 0))
-            waiting_body = ttk.Frame(waiting, style="Card.TFrame")
-            waiting_body.pack(fill="both", expand=True, pady=(12, 8))
-            tk.Label(
-                waiting_body,
-                text="↓",
-                bg=COLOR_SURFACE,
-                fg=COLOR_CYAN,
-                font=("Segoe UI", 34, "bold"),
-            ).pack(side="left", padx=(18, 30))
-            waiting_copy = ttk.Frame(waiting_body, style="Card.TFrame")
-            waiting_copy.pack(side="left", fill="both", expand=True)
-            ttk.Label(waiting_copy, text="Listening for the sender", style="CardTitle.TLabel").pack(anchor="w")
-            ttk.Label(
-                waiting_copy,
-                text=(
-                    "An approval dashboard appears when an offer arrives. You choose the destination before "
-                    "EtherDrop accepts a single byte."
-                ),
-                style="CardMuted.TLabel",
-                wraplength=540,
-                justify="left",
-            ).pack(anchor="w", pady=(6, 0))
-            safety = ttk.Frame(waiting_copy, style="Panel.TFrame", padding=(14, 8))
-            safety.pack(anchor="w", pady=(13, 0))
-            ttk.Label(
-                safety,
-                text="✓  Every transfer requires your approval",
-                background=COLOR_PANEL,
-                foreground=COLOR_SUCCESS,
-                font=("Segoe UI", 9, "bold"),
-            ).pack()
-            ttk.Label(
-                waiting_copy,
-                text="Cancel the folder picker to decline • Cancel during transfer to stop both laptops",
-                style="CardMuted.TLabel",
-                wraplength=540,
-                justify="left",
-            ).pack(anchor="w", pady=(11, 0))
-            self.listbox = None
-            self.send_button = None
+        self.progress = ttk.Progressbar(outer, maximum=100, style="Modern.Horizontal.TProgressbar")
+        self._refresh_connection_ui()
 
-        progress_box = ttk.Frame(outer, style="Card.TFrame", padding=(16, 12))
-        progress_box.pack(fill="x", pady=(14, 0))
-        progress_head = ttk.Frame(progress_box, style="Card.TFrame")
-        progress_head.pack(fill="x")
-        ttk.Label(progress_head, text="Transfer summary", style="CardTitle.TLabel").pack(side="left")
-        ttk.Label(progress_head, textvariable=self.speed_var, style="MetricValue.TLabel").pack(side="right")
-        self.progress = ttk.Progressbar(progress_box, maximum=100, style="Modern.Horizontal.TProgressbar")
-        self.progress.pack(fill="x", pady=(9, 0))
-        ttk.Label(progress_box, textvariable=self.status_var, style="Card.TLabel").pack(anchor="w", pady=(7, 0))
-        ttk.Label(progress_box, textvariable=self.current_var, style="CardMuted.TLabel").pack(anchor="w", pady=(2, 0))
+    def _refresh_connection_ui(self):
+        if self.connection_state is None or not self.connection_state.winfo_exists():
+            return
+        if self.adapter and self.role == "sender" and not self.connection_error:
+            self.connection_state.pack_forget()
+            if not self.file_workspace.winfo_manager():
+                self.file_workspace.pack(fill="both", expand=True)
+            return
+        self.file_workspace.pack_forget()
+        if not self.connection_state.winfo_manager():
+            self.connection_state.pack(fill="both", expand=True)
+        if self.connection_error:
+            icon = "wifi-off" if self.mode == "wifi" else "unplug"
+            title = f"{self.mode_label} needs attention"
+            message = self.connection_error
+            actions = True
+        elif not self.adapter:
+            icon, title = "refresh-cw", f"Checking {self.mode_label}…"
+            message = "Looking for a connected Wi-Fi network." if self.mode == "wifi" else "Looking for a direct Ethernet connection."
+            actions = False
+        elif not self.peer_ip:
+            expected = "receiver" if self.role == "sender" else "sender"
+            icon, title = "wifi" if self.mode == "wifi" else "ethernet-port", f"Looking for a {expected}…"
+            message = f"Open EtherDrop on the other laptop and choose {'Receive' if self.role == 'sender' else 'Send'} files."
+            message += "\nUse the same Wi-Fi network and Wi-Fi mode." if self.mode == "wifi" else "\nUse Ethernet mode on both laptops."
+            actions = True
+        else:
+            icon, title = "download", "Waiting for files"
+            message = "Choose where to save each transfer when it arrives."
+            actions = False
+        self.state_icon.configure(image=icon_image(self, icon, self.mode, 48))
+        self.state_title.configure(text=title)
+        self.state_message.configure(text=message)
+        if actions:
+            self.state_actions.pack(pady=(24, 0))
+        else:
+            self.state_actions.pack_forget()
+
+    def _selected_file_changed(self, event=None):
+        selected = self.listbox.curselection()
+        self.selected_path_var.set(str(self.selected_paths[selected[0]]) if selected and self.selected_paths else "")
+
+    def _show_transfer_options(self):
+        page = self._show_page("Transfer options")
+        card = RoundedCard(page, height=235)
+        card.pack(fill="x")
+        ttk.Checkbutton(card.body, text="Wrap transfer in a folder", variable=self.wrap_var, style="Card.TCheckbutton").pack(anchor="w")
+        ttk.Label(card.body, text="Create a separate folder in the chosen destination. Turn off to save items directly.",
+                  style="CardMuted.TLabel", wraplength=650).pack(anchor="w", pady=(12, 24))
+        ttk.Checkbutton(card.body, text="Verify files with SHA-256", variable=self.verify_var, style="Card.TCheckbutton").pack(anchor="w")
+        ttk.Label(card.body, text="Checks every file during transfer. Leave off for maximum speed.", style="CardMuted.TLabel", wraplength=650).pack(anchor="w", pady=(12, 0))
+
+    def _show_connection(self):
+        page = self._show_page("Connection")
+        card = RoundedCard(page, height=220)
+        card.pack(fill="x")
+        self.link_label = ttk.Label(card.body, textvariable=self.link_var, style="Waiting.TLabel")
+        self.link_label.pack(anchor="w", pady=(0, 14))
+        for variable in (self.adapter_var, self.peer_var, self.sync_var):
+            ttk.Label(card.body, textvariable=variable, style="Card.TLabel", wraplength=700).pack(anchor="w", pady=(0, 10))
+        if self.mode == "wifi":
+            self.peer_list = ttk.Frame(page, style="Card.TFrame")
+            self.peer_tree = ttk.Treeview(self.peer_list, columns=("address",), show="tree headings", height=1)
+            self.peer_tree.heading("#0", text="Laptop")
+            self.peer_tree.heading("address", text="Address")
+            self.peer_tree.column("#0", width=260)
+            self.peer_tree.column("address", width=230)
+            scroll = ttk.Scrollbar(self.peer_list, orient="vertical", command=self.peer_tree.yview)
+            self.peer_tree.configure(yscrollcommand=scroll.set)
+            scroll.pack(side="right", fill="y")
+            self.peer_tree.pack(fill="x")
+            self._refresh_peer_list()
+        controls = ttk.Frame(page, style="App.TFrame")
+        controls.pack(fill="x", pady=(18, 0))
+        ttk.Button(controls, text="Rescan", image=icon_image(self, "refresh-cw", "muted"), compound="left", command=self.rescan).pack(side="left")
+        if self.mode == "ethernet":
+            self.setup_button = ttk.Button(controls, text="Set up Ethernet", command=self.auto_configure_ethernet)
+            self.setup_button.pack(side="left", padx=10)
+        ttk.Label(page, textvariable=self.status_var, style="Subtitle.TLabel", wraplength=700).pack(anchor="w", pady=18)
 
     def _change_role(self) -> None:
+        begin_motion(self)
         self.shutdown_services()
         self.role = None
         self._build_role_ui()
 
     def _set_link_state(self, text: str, state: str) -> None:
-        self.link_var.set(text)
-        if self.link_label:
+        self.link_var.set(text.replace("●  ", "").replace("○ ", "").capitalize())
+        if state != "synced":
+            self.connection_summary_var.set("Searching…" if state == "waiting" else "Needs attention")
+        if self.link_label and self.link_label.winfo_exists():
             style = {
                 "synced": "Sync.TLabel",
                 "lost": "Lost.TLabel",
@@ -2701,50 +3560,43 @@ class EtherDropApp(tk.Tk):
             self.link_label.config(style=style)
 
     def auto_configure_ethernet(self) -> None:
-        if self.setup_in_progress:
+        if self.setup_in_progress or self.transfer_dialog:
             return
-        if self.transfer_dialog and self.transfer_dialog.winfo_exists():
-            messagebox.showerror(APP_NAME, "Finish or cancel the current transfer before configuring Ethernet.")
-            return
+        page = self._show_page("Set up Ethernet")
+        ttk.Label(page, text=("Connect the cable directly to the other laptop. Windows will request administrator permission.\n\n"
+            "EtherDrop checks for an active physical Ethernet adapter without a gateway, enables IPv6 if needed, "
+            "adds direct-link firewall rules, and disables supported selective-suspend settings. "
+            "The adapter restarts only if enabling IPv6 requires it.\n\n"
+            "Wi-Fi, IPv4, DNS, DHCP, MTU, and router settings stay unchanged."),
+            style="Subtitle.TLabel", wraplength=720, justify="left").pack(anchor="w")
+        ttk.Button(page, text="Configure Ethernet", command=self._begin_ethernet_setup, style="Accent.TButton").pack(anchor="e", side="bottom")
 
-        confirmed = messagebox.askyesno(
-            f"{APP_NAME} — Auto-configure Ethernet",
-            (
-                "EtherDrop will request administrator permission and configure only an active physical Ethernet "
-                "adapter with no default gateway.\n\n"
-                "It will:\n"
-                "• enable IPv6 link-local support if needed;\n"
-                "• install firewall rules limited to EtherDrop, wired Ethernet, and link-local peers;\n"
-                "• disable supported adapter selective-suspend settings;\n"
-                "• restart Ethernet only if enabling IPv6 requires it.\n\n"
-                "Wi-Fi, IPv4, DNS, DHCP, MTU, and router settings will not be changed.\n\n"
-                "Make sure the cable goes directly to the other laptop. Continue?"
-            ),
-            icon="question",
-        )
-        if not confirmed:
-            return
-
+    def _begin_ethernet_setup(self):
+        page = self._show_page("Configuring Ethernet")
+        for child in page.winfo_children():
+            if isinstance(child, ttk.Frame):
+                child.destroy()
+        self.setup_dialog = page
         self.setup_in_progress = True
-        if self.setup_button:
-            self.setup_button.config(state="disabled")
         self.shutdown_services()
-        self._set_link_state("●  CONFIGURING", "waiting")
+        self._set_link_state("Configuring", "waiting")
         self.status_var.set("Waiting for Ethernet configuration and administrator approval…")
-        self.setup_dialog = EthernetSetupDialog(self)
+        progress = ttk.Progressbar(page, mode="indeterminate", style="Modern.Horizontal.TProgressbar")
+        progress.pack(fill="x", pady=24)
+        progress.start(12)
+        ttk.Label(page, textvariable=self.status_var, style="Subtitle.TLabel", wraplength=700).pack(anchor="w")
 
-        def worker() -> None:
+        def worker():
             try:
                 report = run_ethernet_autoconfigure(Path(sys.executable).resolve())
                 self.events.put(("setup_done", report))
             except Exception as exc:
                 self.events.put(("setup_error", str(exc)))
-
         threading.Thread(target=worker, daemon=True, name="ethernet-auto-setup").start()
 
     def _close_setup_dialog(self) -> None:
-        if self.setup_dialog and self.setup_dialog.winfo_exists():
-            self.setup_dialog.close()
+        if self.setup_dialog:
+            self._dismiss_page()
         self.setup_dialog = None
 
     @staticmethod
@@ -2757,7 +3609,7 @@ class EtherDropApp(tk.Tk):
     def _handle_setup_done(self, report: dict) -> None:
         self.setup_in_progress = False
         self._close_setup_dialog()
-        if self.setup_button:
+        if self.setup_button and self.setup_button.winfo_exists():
             self.setup_button.config(state="normal")
 
         actions = self._report_values(report, "Actions")
@@ -2771,18 +3623,18 @@ class EtherDropApp(tk.Tk):
         ]
         if warnings:
             lines.extend(("", "Warnings:", *(f"• {warning}" for warning in warnings)))
-        messagebox.showinfo(f"{APP_NAME} — Ethernet configured", "\n".join(lines), parent=self)
+        self._show_message("Ethernet configured", "\n".join(lines))
         self.status_var.set("Ethernet configuration completed. Rescanning the direct link…")
         self.after(200, self.rescan)
 
     def _handle_setup_error(self, message: str) -> None:
         self.setup_in_progress = False
         self._close_setup_dialog()
-        if self.setup_button:
+        if self.setup_button and self.setup_button.winfo_exists():
             self.setup_button.config(state="normal")
         self._set_link_state("●  SETUP NOT COMPLETED", "lost")
         self.status_var.set(message)
-        messagebox.showerror(f"{APP_NAME} — Ethernet setup", message, parent=self)
+        self._show_message("Ethernet setup", message)
         self.after(200, self.rescan)
 
     def shutdown_services(self) -> None:
@@ -2800,6 +3652,9 @@ class EtherDropApp(tk.Tk):
         self.peer_name = None
         self.peer_role = None
         self.peer_last_seen = 0.0
+        self.wifi_peers.clear()
+        self.connection_error = ""
+        self.connection_summary_var.set("Checking connection…")
 
     def rescan(self) -> None:
         if not self.role:
@@ -2808,19 +3663,28 @@ class EtherDropApp(tk.Tk):
         self.scan_token += 1
         token = self.scan_token
         role = self.role
-        self.adapter_var.set("Ethernet: scanning…")
+        self.adapter_var.set(f"{self.mode_label}: scanning…")
         expected = "receiver" if role == "sender" else "sender"
         self.peer_var.set(f"Peer: searching for a {expected}…")
         self._set_link_state("●  SEARCHING", "waiting")
+        self.connection_summary_var.set(f"Checking {self.mode_label}…")
+        self.status_var.set(f"Checking the {self.mode_label} connection…")
         self.sync_var.set("Waiting for a live heartbeat from the other laptop.")
         if self.send_button:
             self.send_button.config(state="disabled")
+        self._refresh_connection_ui()
         self.update_idletasks()
 
         def worker():
             try:
-                adapter = choose_direct_adapter()
-                self.events.put(("adapter", token, role, adapter))
+                if self.mode == "wifi":
+                    adapters = discover_wifi_adapters()
+                    if not adapters:
+                        raise RuntimeError("No connected physical Wi-Fi adapter with an IPv4 address was found. Connect to Wi-Fi, then rescan.")
+                    self.events.put(("wifi_adapters", token, role, adapters))
+                else:
+                    adapter = choose_direct_adapter()
+                    self.events.put(("adapter", token, role, adapter))
             except Exception as exc:
                 self.events.put(("adapter_error", token, role, str(exc)))
 
@@ -2830,25 +3694,70 @@ class EtherDropApp(tk.Tk):
         if not self.role:
             return
         self.adapter = adapter
-        self.discovery = DiscoveryService(adapter, self.events, self.role)
+        self.discovery = WifiDiscoveryService(adapter, self.events, self.role) if self.mode == "wifi" else DiscoveryService(adapter, self.events, self.role)
         if self.role == "receiver":
             self.receiver = ReceiverService(adapter, self.events, self.coordinator)
             self.receiver.start()
         else:
-            self.sender = Sender(adapter, self.events, self.coordinator)
+            self.sender = SenderGroup(adapter, self.events, self.coordinator) if self.mode == "wifi" else Sender(adapter, self.events, self.coordinator)
         self.discovery.start()
 
+    @property
+    def mode_label(self):
+        return "Wi-Fi" if self.mode == "wifi" else "Ethernet"
+
+    def _choose_wifi_adapter(self, adapters, token, role):
+        if len(adapters) == 1:
+            self.events.put(("adapter", token, role, adapters[0]))
+            return
+        page = self._show_page("Choose a Wi-Fi adapter")
+        def choose(adapter):
+            self._dismiss_page()
+            self.events.put(("adapter", token, role, adapter))
+        for adapter in adapters:
+            ttk.Button(page, text=f"{adapter.name} · {adapter.address}",
+                       command=lambda adapter=adapter: choose(adapter)).pack(fill="x", pady=6)
+
+    def _refresh_wifi_peers(self):
+        peers = list(self.wifi_peers.values())
+        self.peer_ip = peers[0]["ip"] if peers else None
+        self.peer_name = peers[0]["name"] if peers else None
+        self.peer_var.set(f"{len(peers)} {'receiver' if self.role == 'sender' else 'sender'}(s) discovered")
+        self.connection_error = ""
+        self._refresh_peer_list()
+        self._set_link_state(f"{len(peers)} laptops discovered" if peers else "Searching", "synced" if peers else "waiting")
+        if peers:
+            role = "receiver" if self.role == "sender" else "sender"
+            self.connection_summary_var.set(f"{len(peers)} {role}{'s' if len(peers) != 1 else ''} connected")
+        else:
+            self.connection_summary_var.set(f"Looking for a {'receiver' if self.role == 'sender' else 'sender'}…")
+        self.sync_var.set("Receivers discovered on the local Wi-Fi network." if peers else "Waiting for local Wi-Fi discovery.")
+        if not self.transfer_dialog:
+            self.status_var.set("Ready to send to all discovered receivers." if peers and self.role == "sender" else "Waiting for a transfer offer." if peers else "Searching on Wi-Fi…")
+        self._refresh_send_state()
+        self._refresh_connection_ui()
+
+    def _refresh_peer_list(self):
+        if self.peer_tree is None or not self.peer_tree.winfo_exists():
+            return
+        self.peer_tree.delete(*self.peer_tree.get_children())
+        for session, peer in self.wifi_peers.items():
+            self.peer_tree.insert("", "end", iid=session, text=peer["name"], values=(peer["ip"],))
+        if self.wifi_peers:
+            self.peer_tree.configure(height=min(len(self.wifi_peers), 4))
+            self.peer_list.pack(fill="x", pady=(16, 0))
+        else:
+            self.peer_list.pack_forget()
+
     def add_files(self) -> None:
-        paths = filedialog.askopenfilenames(title="Choose files to send")
-        for p in paths:
-            path = Path(p)
-            if path not in self.selected_paths:
-                self.selected_paths.append(path)
-        self.refresh_list()
+        self._add_selected_paths(filedialog.askopenfilenames(title="Choose files to send"))
 
     def add_folder(self) -> None:
-        p = filedialog.askdirectory(title="Choose folder to send")
-        if p:
+        path = filedialog.askdirectory(title="Choose folder to send")
+        self._add_selected_paths([path] if path else [])
+
+    def _add_selected_paths(self, paths) -> None:
+        for p in paths:
             path = Path(p)
             if path not in self.selected_paths:
                 self.selected_paths.append(path)
@@ -2862,15 +3771,14 @@ class EtherDropApp(tk.Tk):
         if not self.listbox:
             return
         self.listbox.delete(0, tk.END)
+        self.selection_var.set(f"{len(self.selected_paths)} items selected" if self.selected_paths else "Files to share")
+        self.selected_path_var.set("")
         if not self.selected_paths:
-            self.listbox.insert(tk.END, "  No files selected — add files or a folder to begin")
-            self.listbox.itemconfig(0, foreground=COLOR_MUTED, selectbackground=COLOR_PANEL)
+            self.listbox.insert(tk.END, "Drop files or folders here, or use Add files / Add folder.")
+            self.listbox.itemconfig(0, foreground=COLOR_MUTED)
         else:
-            for index, path in enumerate(self.selected_paths):
-                item_type = "FOLDER" if path.is_dir() else "FILE"
-                self.listbox.insert(tk.END, f"  {item_type:<6}  {path}")
-                if path.is_dir():
-                    self.listbox.itemconfig(index, foreground=COLOR_CYAN)
+            for path in self.selected_paths:
+                self.listbox.insert(tk.END, f"  {path.name}" + (" /" if path.is_dir() else ""))
         self._refresh_send_state()
 
     def _refresh_send_state(self) -> None:
@@ -2882,7 +3790,7 @@ class EtherDropApp(tk.Tk):
 
     def send_selected(self) -> None:
         if not self.sender or not self.peer_ip or not self.peer_name:
-            messagebox.showerror(APP_NAME, "No other EtherDrop laptop is connected.")
+            self.status_var.set("No other EtherDrop laptop is connected.")
             return
         if not self.selected_paths:
             return
@@ -2891,14 +3799,28 @@ class EtherDropApp(tk.Tk):
         self.progress["value"] = 0
         self.status_var.set("Preparing transfer…")
         self.speed_var.set("")
+        if self.mode == "wifi":
+            recipients = self.sender.send(list(self.wifi_peers.values()), list(self.selected_paths),
+                                          bool(self.verify_var.get()), bool(self.wrap_var.get()))
+            if not recipients:
+                self._refresh_send_state()
+                return
+            self._dismiss_page()
+            self.transfer_dialog = GroupTransferDialog(self, recipients, list(self.selected_paths), bool(self.verify_var.get()))
+            show_view(self.transfer_dialog, self.screen)
+            self.keep_awake_active, power_status = set_system_awake(True)
+            self.transfer_dialog.set_detail("Windows keep-awake request", power_status)
+            self._refresh_send_state()
+            return
         transfer_id = self.sender.send(
             self.peer_ip,
             self.peer_name,
             list(self.selected_paths),
             bool(self.verify_var.get()),
+            bool(self.wrap_var.get()),
         )
         if not transfer_id:
-            messagebox.showerror(APP_NAME, "This laptop is already handling another transfer.")
+            self.status_var.set("This laptop is already handling another transfer.")
             self._refresh_send_state()
             return
         self._open_transfer_dialog(
@@ -2920,11 +3842,12 @@ class EtherDropApp(tk.Tk):
         verify: bool,
         sources: list[Path] | None,
         cancel_callback,
-    ) -> TransferDialog:
+    ) -> TransferView:
         if not self.adapter:
-            raise RuntimeError("Ethernet adapter is unavailable.")
+            raise RuntimeError("Network adapter is unavailable.")
         self.active_transfer_id = transfer_id
-        dialog = TransferDialog(
+        self._dismiss_page()
+        dialog = TransferPanel(
             self,
             transfer_id,
             direction,
@@ -2936,16 +3859,20 @@ class EtherDropApp(tk.Tk):
             verify=verify,
             sources=sources,
         )
+        show_view(dialog, self.screen)
         self.transfer_dialog = dialog
         self.keep_awake_active, power_status = set_system_awake(True)
         dialog.set_detail("Windows keep-awake request", power_status)
         self._refresh_send_state()
         return dialog
 
-    def _transfer_dialog_closed(self, dialog: TransferDialog) -> None:
+    def _transfer_dialog_closed(self, dialog: TransferView) -> None:
         if self.transfer_dialog is dialog:
             self.transfer_dialog = None
             self.active_transfer_id = None
+        self._build_main_ui()
+        if self.mode == "wifi":
+            self._refresh_wifi_peers()
         self._refresh_send_state()
 
     def _release_keep_awake(self) -> None:
@@ -2959,7 +3886,7 @@ class EtherDropApp(tk.Tk):
         self,
         transfer_id: str,
         decision: IncomingTransferDecision,
-        dialog: TransferDialog,
+        dialog: TransferView,
     ) -> None:
         if not dialog.winfo_exists() or transfer_id != self.active_transfer_id:
             decision.reject("The receiver window closed before a destination was selected.")
@@ -2970,7 +3897,7 @@ class EtherDropApp(tk.Tk):
         initial = self.last_destination if self.last_destination.exists() else Path.home()
         selected = filedialog.askdirectory(
             parent=dialog,
-            title="Choose the parent folder for this incoming transfer",
+            title="Choose where to save this incoming transfer",
             initialdir=str(initial),
             mustexist=True,
         )
@@ -2981,12 +3908,23 @@ class EtherDropApp(tk.Tk):
             self.last_destination = Path(selected)
             dialog.set_detail("Chosen destination parent", selected)
             dialog.set_phase("Accepting", "Destination confirmed. Synchronizing acceptance with the sender…")
-            decision.accept(Path(selected))
+            decision.accept(Path(selected), self.winfo_id())
         else:
             dialog.set_phase("Declining", "No destination folder was selected; declining the transfer.")
             decision.reject("The receiver did not choose a destination folder.")
 
     def _handle_transfer_event(self, transfer_id: str, action: str, data: dict) -> None:
+        if isinstance(self.transfer_dialog, GroupTransferDialog):
+            if transfer_id not in self.transfer_dialog.panels:
+                return
+            if action == "worker_stopped":
+                if self.sender.worker_stopped(transfer_id):
+                    self.transfer_dialog.complete()
+                    self._release_keep_awake()
+                    self.status_var.set("Group transfer finished. Review each laptop’s result.")
+            else:
+                self.transfer_dialog.apply_transfer(transfer_id, action, data)
+            return
         if action == "incoming_offer":
             decision: IncomingTransferDecision = data["decision"]
             if self.update_installing:
@@ -2994,6 +3932,9 @@ class EtherDropApp(tk.Tk):
                 return
             if self.role != "receiver" or not self.receiver:
                 decision.reject("This laptop is not in receiver mode.")
+                return
+            if self.transfer_dialog and self.transfer_dialog.winfo_exists():
+                decision.reject("Please wait until the previous transfer result is closed.")
                 return
             dialog = self._open_transfer_dialog(
                 transfer_id=transfer_id,
@@ -3011,6 +3952,7 @@ class EtherDropApp(tk.Tk):
                     "Top-level items": " | ".join(data.get("roots", [])) or "Not supplied",
                     "File count": data.get("file_count", 0),
                     "Total bytes": f"{human_bytes(data.get('total', 0))} ({data.get('total', 0)} bytes)",
+                    "Save layout": "Separate transfer folder" if data.get("wrap", True) else "Directly in chosen destination",
                 }
             )
             dialog.set_phase(
@@ -3029,6 +3971,13 @@ class EtherDropApp(tk.Tk):
 
         if action == "phase":
             self.status_var.set(str(data.get("message") or data.get("phase") or "Working…"))
+        elif action == "paused":
+            self.status_var.set("Connection interrupted. Waiting to reconnect — keep both apps open.")
+            self.speed_var.set("Waiting to reconnect")
+        elif action == "resumed":
+            self.progress["value"] = data.get("done", 0) / data["total"] * 100 if data.get("total") else 100
+            self.status_var.set("Connection restored. Continuing from saved progress.")
+            self.speed_var.set("")
         elif action == "prepared":
             self.status_var.set(f"Prepared {data.get('file_count', 0)} file(s) — {human_bytes(data.get('total', 0))}.")
         elif action == "start":
@@ -3065,8 +4014,15 @@ class EtherDropApp(tk.Tk):
                 if kind == "update_checked":
                     self._offer_update(event[1], event[2])
 
+                elif kind == "files_dropped":
+                    _, widget, paths = event
+                    if (self.role == "sender" and self.listbox is widget and self.page is None
+                            and self.transfer_dialog is None and widget.winfo_ismapped()):
+                        self._add_selected_paths(paths)
+
                 elif kind == "update_progress":
-                    self.update_var.set(f"Downloading… {event[1] / event[2] * 100:.0f}%")
+                    self.update_var.set(f"{event[1] / 1_000_000:.1f} / {event[2] / 1_000_000:.1f} MB · {event[3] / 1_000_000:.1f} MB/s")
+                    self.update_progress_var.set(event[1] / event[2] * 100)
 
                 elif kind == "update_error":
                     self._handle_update_error(event[1], event[2])
@@ -3085,32 +4041,57 @@ class EtherDropApp(tk.Tk):
                         self.destroy()
                         return
 
+                elif kind == "wifi_adapters":
+                    _, token, role, adapters = event
+                    if token == self.scan_token and role == self.role:
+                        self._choose_wifi_adapter(adapters, token, role)
+
+                elif kind in ("wifi_peer", "wifi_peer_lost", "wifi_discovery_error"):
+                    if not isinstance(self.discovery, WifiDiscoveryService) or event[1] != self.discovery.token:
+                        continue
+                    if kind == "wifi_peer":
+                        _, _, session, name, address, role = event
+                        self.wifi_peers[session] = {"name": name, "ip": address, "role": role}
+                    elif kind == "wifi_peer_lost":
+                        self.wifi_peers.pop(event[2], None)
+                    else:
+                        self.status_var.set(f"Wi-Fi discovery failed: {event[2]}")
+                        self.connection_error = self.status_var.get()
+                        self._set_link_state("Discovery failed", "lost")
+                        continue
+                    self._refresh_wifi_peers()
+
                 elif kind == "adapter":
                     _, token, role, adapter = event
                     if token != self.scan_token or role != self.role:
                         continue
                     self._start_services(adapter)
                     speed = adapter.link_speed or human_bytes(min(adapter.rx_bps, adapter.tx_bps) / 8) + "/s"
-                    self.adapter_var.set(f"Ethernet: {adapter.name} — {speed} — direct-link mode")
+                    self.adapter_var.set(f"{self.mode_label}: {adapter.name} — {speed} — {'local network' if self.mode == 'wifi' else 'direct-link mode'}")
                     expected = "receiver" if self.role == "sender" else "sender"
-                    self.status_var.set(f"Ethernet ready. Waiting for the {expected} laptop…")
+                    self.status_var.set(f"{self.mode_label} ready. Waiting for the {expected} laptop…")
+                    self.connection_error = ""
+                    self.connection_summary_var.set(f"Looking for a {expected}…")
 
                 elif kind == "adapter_error":
                     _, token, role, message = event
                     if token != self.scan_token or role != self.role:
                         continue
-                    self.adapter_var.set("Ethernet: unavailable")
+                    self.adapter_var.set(f"{self.mode_label}: unavailable")
                     self.status_var.set(message)
+                    self.connection_error = message
                     self.peer_var.set("Peer: not connected")
                     self._set_link_state("●  NOT CONNECTED", "lost")
 
                 elif kind == "peer":
+                    self.connection_error = ""
                     self.peer_name, self.peer_ip, self.peer_role = event[1], event[2], event[3]
                     self.peer_last_seen = time.monotonic()
                     label = self.peer_role.capitalize()
                     scope = self.adapter.if_index if self.adapter else 0
                     self.peer_var.set(f"{label}: {self.peer_name} — [{self.peer_ip}%{scope}]")
-                    self._set_link_state("●  LINKED & SYNCED", "synced")
+                    self._set_link_state("Linked & synced", "synced")
+                    self.connection_summary_var.set(f"Connected to {self.peer_name}")
                     if self.transfer_dialog and self.transfer_dialog.winfo_exists():
                         self.transfer_dialog.set_detail(
                             "Latest peer discovery heartbeat",
@@ -3129,6 +4110,8 @@ class EtherDropApp(tk.Tk):
                     self.peer_var.set(f"Peer: searching for a {expected}…")
                     self._set_link_state("●  CONNECTION LOST", "lost")
                     self.sync_var.set("The peer heartbeat stopped. Check the cable and the other laptop.")
+                    self.connection_error = "The connection to the other laptop was lost.\nCheck the cable and keep EtherDrop open on both laptops, then rescan."
+                    self.status_var.set(self.connection_error)
                     if self.transfer_dialog and self.transfer_dialog.winfo_exists():
                         self.transfer_dialog.set_detail("Discovery synchronization", "Heartbeat lost")
                         self.transfer_dialog.add_log("Peer discovery heartbeat was lost; the TCP transfer determines final status.")
@@ -3146,6 +4129,7 @@ class EtherDropApp(tk.Tk):
 
                 elif kind == "error":
                     self.status_var.set(event[1])
+                    self.connection_error = event[1]
                     self.speed_var.set("")
                     self._refresh_send_state()
 
@@ -3153,10 +4137,11 @@ class EtherDropApp(tk.Tk):
             pass
         finally:
             if not self._closing:
+                self._refresh_connection_ui()
                 self.after(100, self._drain_events)
 
     def _connection_tick(self) -> None:
-        if self.peer_ip and self.peer_last_seen:
+        if self.mode == "ethernet" and self.peer_ip and self.peer_last_seen:
             age = max(time.monotonic() - self.peer_last_seen, 0.0)
             self.sync_var.set(f"Live peer heartbeat received {age:.1f}s ago — both clients are synchronized.")
             if self.transfer_dialog and self.transfer_dialog.winfo_exists():
@@ -3165,14 +4150,20 @@ class EtherDropApp(tk.Tk):
 
     def _close(self) -> None:
         if self.update_installing:
-            messagebox.showwarning(APP_NAME, "Please wait for the update download to finish.", parent=self.update_dialog or self)
+            self.update_var.set("Please wait for the download to finish.")
             return
         if self.setup_in_progress:
-            messagebox.showwarning(
-                APP_NAME,
-                "Ethernet configuration is still running. Complete or cancel the Windows administrator prompt first.",
-                parent=self.setup_dialog or self,
-            )
+            self.status_var.set("Complete or cancel the Windows administrator prompt first.")
+            return
+        if self.coordinator.locked() and (self.sender or self.receiver):
+            if not self.close_after_transfer:
+                self.close_after_transfer = True
+                if self.sender:
+                    self.sender.cancel()
+                if self.receiver:
+                    self.receiver.cancel()
+                self.status_var.set("Cancelling the transfer and removing new output before closing…")
+            self.after(100, self._close)
             return
         self.shutdown_services()
         self._release_keep_awake()
@@ -3180,11 +4171,13 @@ class EtherDropApp(tk.Tk):
         self.destroy()
 
 
+
 def main() -> None:
     if platform.system() != "Windows":
         print("EtherDrop is currently Windows-only.", file=sys.stderr)
         raise SystemExit(1)
 
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_NAME)
     app = EtherDropApp()
     app.mainloop()
 

@@ -5,7 +5,7 @@ a = Analysis(
     ['etherdrop.py'],
     pathex=[],
     binaries=[],
-    datas=[('RELEASE_NOTES.md', '.')],
+    datas=[('RELEASE_NOTES.md', '.'), ('assets', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,5 +35,6 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['assets/etherdrop.ico'],
     manifest='EtherDrop.manifest',
 )
