@@ -96,7 +96,7 @@ class InterfaceTests(unittest.TestCase):
 
     def test_native_drop_appends_files_and_folders_without_duplicates_in_both_modes(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
+            root = Path(folder).resolve()
             existing = root / 'already selected.txt'
             existing.write_text('Selected')
             file = root / 'ملف 📁 with spaces.txt'
